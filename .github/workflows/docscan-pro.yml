@@ -27,8 +27,16 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Installer le SDK Android
-        uses: android-actions/setup-android@v3
+      - name: Preparer le SDK Android (deja present sur le serveur)
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          ls "$SDK/platforms" || true
+          yes | "$SM" --licenses > /dev/null 2>&1 || true
+          yes | "$SM" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null 2>&1 || echo "Installation SDK partielle, Gradle completera"
+          ls "$SDK/platforms" "$SDK/build-tools" || true
 
       - name: Installer Gradle 8.7
         uses: gradle/actions/setup-gradle@v3
@@ -4517,7 +4525,9 @@ jobs:
 
       - name: Compiler l'APK release signee
         working-directory: docscan-pro
-        run: gradle assembleRelease --no-daemon --stacktrace
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          gradle assembleRelease --no-daemon --stacktrace
 
       - name: Renommer l'APK
         run: |
