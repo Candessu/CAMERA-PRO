@@ -127,8 +127,8 @@ jobs:
                   applicationId = "com.docscan.pro"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
-                  versionName = "1.0.0"
+                  versionCode = 6
+                  versionName = "1.4.0"
                   testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
                   vectorDrawables { useSupportLibrary = true }
                   ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
@@ -210,9 +210,11 @@ jobs:
               implementation("androidx.camera:camera-camera2:$camerax")
               implementation("androidx.camera:camera-lifecycle:$camerax")
               implementation("androidx.camera:camera-view:$camerax")
+              implementation("androidx.camera:camera-video:$camerax")
 
               implementation("org.opencv:opencv:4.9.0")
               implementation("com.google.mlkit:text-recognition:16.0.0")
+              implementation("com.google.mlkit:face-detection:16.1.6")
 
               implementation("androidx.room:room-runtime:2.6.1")
               implementation("androidx.room:room-ktx:2.6.1")
@@ -220,7 +222,9 @@ jobs:
               implementation("androidx.datastore:datastore-preferences:1.0.0")
 
               implementation("io.coil-kt:coil-compose:2.6.0")
+              implementation("io.coil-kt:coil-video:2.6.0")
               implementation("androidx.exifinterface:exifinterface:1.3.7")
+              implementation("androidx.documentfile:documentfile:1.0.1")
               implementation("androidx.biometric:biometric:1.1.0")
               implementation("androidx.security:security-crypto:1.0.0")
               implementation("com.google.accompanist:accompanist-permissions:0.34.0")
@@ -251,9 +255,12 @@ jobs:
 
               <uses-permission android:name="android.permission.CAMERA" />
               <uses-permission android:name="android.permission.FLASHLIGHT" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
               <uses-permission android:name="android.permission.USE_BIOMETRIC" />
               <!-- Scoped storage : pas de WRITE_EXTERNAL_STORAGE sur API 29+ -->
               <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
               <uses-feature android:name="android.hardware.camera.any" android:required="true" />
               <uses-feature android:name="android.hardware.camera.flash" android:required="false" />
@@ -298,6 +305,9 @@ jobs:
           package com.docscan.pro
 
           import android.app.Application
+          import coil.ImageLoader
+          import coil.ImageLoaderFactory
+          import coil.decode.VideoFrameDecoder
           import android.os.Bundle
           import androidx.activity.compose.setContent
           import androidx.activity.enableEdgeToEdge
@@ -316,7 +326,7 @@ jobs:
 
           /** Application Hilt ; charge OpenCV et nettoie les PDF déchiffrés temporaires. */
           @HiltAndroidApp
-          class DocScanApp : Application() {
+          class DocScanApp : Application(), ImageLoaderFactory {
               @Inject lateinit var fileStore: FileStore
 
               override fun onCreate() {
@@ -324,6 +334,12 @@ jobs:
                   OpenCvInit.ensure()
                   fileStore.clearShareCache()
               }
+
+              /** Coil sait aussi afficher la première image d'une vidéo (vignette). */
+              override fun newImageLoader(): ImageLoader = ImageLoader.Builder(this)
+                  .components { add(VideoFrameDecoder.Factory()) }
+                  .crossfade(true)
+                  .build()
           }
 
           /** Activité unique (FragmentActivity requise par BiometricPrompt). */
@@ -346,10 +362,32 @@ jobs:
           cat > 'app/src/main/java/com/docscan/pro/core/camera/CameraController.kt' << 'DSP_EOF_8'
           package com.docscan.pro.core.camera
 
+          import android.Manifest
+          import android.annotation.SuppressLint
           import android.content.Context
+          import android.hardware.camera2.CaptureRequest
+          import androidx.annotation.OptIn
+          import androidx.camera.camera2.interop.Camera2Interop
+          import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+          import kotlinx.coroutines.withTimeoutOrNull
+          import android.content.pm.PackageManager
+          import androidx.camera.core.AspectRatio
+          import androidx.camera.video.FallbackStrategy
+          import androidx.camera.video.FileDescriptorOutputOptions
+          import androidx.camera.video.FileOutputOptions
+          import androidx.camera.video.Quality
+          import androidx.camera.video.QualitySelector
+          import androidx.camera.video.Recorder
+          import androidx.camera.video.Recording
+          import androidx.camera.video.VideoCapture
+          import androidx.camera.video.VideoRecordEvent
+          import com.docscan.pro.core.utils.VideoTarget
+          import com.docscan.pro.data.model.VideoQuality
+          import android.net.Uri
           import android.util.Size
           import androidx.camera.core.Camera
           import androidx.camera.core.CameraSelector
+          import androidx.camera.core.FocusMeteringAction
           import androidx.camera.core.ImageAnalysis
           import androidx.camera.core.ImageCapture
           import androidx.camera.core.ImageCaptureException
@@ -362,15 +400,17 @@ jobs:
           import androidx.core.content.ContextCompat
           import androidx.lifecycle.LifecycleOwner
           import com.docscan.pro.data.model.AppResult
+          import com.docscan.pro.data.model.FlashSetting
           import kotlinx.coroutines.suspendCancellableCoroutine
           import java.io.File
           import java.util.concurrent.ExecutorService
           import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
           import kotlin.coroutines.resume
 
           /**
-           * Pilote CameraX : aperçu 4:3, analyse temps réel (640x480) et capture haute qualité.
-           * Lié au cycle de vie de l'écran ; appeler [release] à la destruction.
+           * Pilote CameraX : aperçu 4:3, analyse temps réel (640x480), capture haute qualité,
+           * flash, torche, zoom par pincement, mise au point par toucher, caméra avant/arrière.
            */
           class CameraController(private val context: Context) {
 
@@ -379,9 +419,24 @@ jobs:
               private var analysis: ImageAnalysis? = null
               private var camera: Camera? = null
               private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+              private var flashMode: Int = ImageCapture.FLASH_MODE_OFF
+              private var torchWanted = false
+              private var videoCapture: VideoCapture<Recorder>? = null
+              private var recording: Recording? = null
 
-              /** Lie les cas d'usage caméra au [owner]. */
-              fun bind(owner: LifecycleOwner, previewView: PreviewView, analyzer: ImageAnalysis.Analyzer, onError: (Throwable) -> Unit) {
+              /**
+               * Lie les cas d'usage caméra au [owner] ; [front] choisit la caméra avant.
+               * [video] = aperçu 16:9 + enregistrement vidéo, sinon aperçu 4:3 + analyse + photo.
+               */
+              fun bind(
+                  owner: LifecycleOwner,
+                  previewView: PreviewView,
+                  analyzer: ImageAnalysis.Analyzer,
+                  front: Boolean,
+                  video: Boolean,
+                  videoQuality: VideoQuality,
+                  onError: (Throwable) -> Unit
+              ) {
                   val future = ProcessCameraProvider.getInstance(context)
                   future.addListener({
                       try {
@@ -396,6 +451,38 @@ jobs:
                                   ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER)
                               )
                               .build()
+                          val selector = if (front && hasCamera(p, CameraSelector.DEFAULT_FRONT_CAMERA))
+                              CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+                          if (video) {
+                              val ratio169 = ResolutionSelector.Builder()
+                                  .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                                  .build()
+                              val preview = Preview.Builder().setResolutionSelector(ratio169).build()
+                              preview.setSurfaceProvider(previewView.surfaceProvider)
+                              val target = when (videoQuality.height) {
+                                  1080 -> Quality.FHD
+                                  720 -> Quality.HD
+                                  else -> Quality.SD
+                              }
+                              val recorder = Recorder.Builder()
+                                  .setQualitySelector(
+                                      QualitySelector.from(target, FallbackStrategy.lowerQualityOrHigherThan(target))
+                                  )
+                                  .setTargetVideoEncodingBitRate(videoQuality.bitRate)
+                                  .setAspectRatio(AspectRatio.RATIO_16_9)
+                                  .build()
+                              val vc = VideoCapture.withOutput(recorder)
+                              videoCapture = vc
+                              imageCapture = null
+                              analysis?.clearAnalyzer()
+                              analysis = null
+                              p.unbindAll()
+                              val cam = p.bindToLifecycle(owner, selector, preview, vc)
+                              camera = cam
+                              if (torchWanted && cam.cameraInfo.hasFlashUnit()) cam.cameraControl.enableTorch(true)
+                              return@addListener
+                          }
+                          videoCapture = null
                           val preview = Preview.Builder().setResolutionSelector(ratio43).build()
                           preview.setSurfaceProvider(previewView.surfaceProvider)
                           val ia = ImageAnalysis.Builder()
@@ -405,48 +492,158 @@ jobs:
                               .build()
                           ia.setAnalyzer(analysisExecutor, analyzer)
                           analysis = ia
-                          val capture = ImageCapture.Builder()
-                              .setResolutionSelector(ratio43)
-                              .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                          // Capture : plus haute résolution 4:3 du capteur (≈ 12 Mpx sur Redmi Note 11 Pro),
+                          // JPEG 100 %, réduction de bruit et netteté en mode « haute qualité ».
+                          val highest = ResolutionSelector.Builder()
+                              .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                              .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
                               .build()
+                          val captureBuilder = ImageCapture.Builder()
+                              .setResolutionSelector(highest)
+                              .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                              .setJpegQuality(100)
+                              .setFlashMode(flashMode)
+                          applyHighQuality(captureBuilder)
+                          val capture = captureBuilder.build()
                           imageCapture = capture
                           p.unbindAll()
-                          camera = p.bindToLifecycle(owner, CameraSelector.DEFAULT_BACK_CAMERA, preview, ia, capture)
+                          val cam = p.bindToLifecycle(owner, selector, preview, ia, capture)
+                          camera = cam
+                          if (torchWanted && cam.cameraInfo.hasFlashUnit()) cam.cameraControl.enableTorch(true)
                       } catch (t: Throwable) {
                           onError(t)
                       }
                   }, ContextCompat.getMainExecutor(context))
               }
 
-              /** Capture une photo dans [file]. */
-              suspend fun capture(file: File): AppResult<File> = suspendCancellableCoroutine { cont ->
-                  val capture = imageCapture
-                  if (capture == null) {
-                      cont.resume(AppResult.Error("Caméra non prête")); return@suspendCancellableCoroutine
+              @OptIn(ExperimentalCamera2Interop::class)
+              private fun applyHighQuality(builder: ImageCapture.Builder) {
+                  try {
+                      Camera2Interop.Extender(builder)
+                          .setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                          .setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+                  } catch (e: Exception) {
+                      // Option non prise en charge : CameraX garde ses valeurs par défaut.
                   }
-                  val options = ImageCapture.OutputFileOptions.Builder(file).build()
-                  capture.takePicture(options, ContextCompat.getMainExecutor(context),
-                      object : ImageCapture.OnImageSavedCallback {
-                          override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                              if (cont.isActive) cont.resume(AppResult.Success(file))
-                          }
-
-                          override fun onError(exception: ImageCaptureException) {
-                              if (cont.isActive) cont.resume(AppResult.Error(exception.message ?: "Capture échouée", exception))
-                          }
-                      })
               }
 
-              /** Allume / éteint la torche. */
+              /** Mise au point sur ([x], [y]) en pixels de l'aperçu, en attendant au plus [timeoutMs] ms. */
+              suspend fun focusAndWait(view: PreviewView, x: Float, y: Float, timeoutMs: Long = 1200) {
+                  val cam = camera ?: return
+                  val point = view.meteringPointFactory.createPoint(x, y)
+                  val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                      .setAutoCancelDuration(4, TimeUnit.SECONDS)
+                      .build()
+                  val future = cam.cameraControl.startFocusAndMetering(action)
+                  withTimeoutOrNull(timeoutMs) {
+                      suspendCancellableCoroutine<Unit> { cont ->
+                          future.addListener({ if (cont.isActive) cont.resume(Unit) }, ContextCompat.getMainExecutor(context))
+                      }
+                  }
+              }
+
+              private fun hasCamera(p: ProcessCameraProvider, selector: CameraSelector): Boolean =
+                  try { p.hasCamera(selector) } catch (e: Exception) { false }
+
+              /** Capture une photo dans un fichier privé (mode Documents). */
+              suspend fun capture(file: File): AppResult<File> =
+                  when (val r = take(ImageCapture.OutputFileOptions.Builder(file).build())) {
+                      is AppResult.Success -> AppResult.Success(file)
+                      is AppResult.Error -> r
+                  }
+
+              /** Capture une photo vers [options] (galerie) ; renvoie l'Uri enregistrée si connue. */
+              suspend fun captureTo(options: ImageCapture.OutputFileOptions): AppResult<Uri?> = take(options)
+
+              private suspend fun take(options: ImageCapture.OutputFileOptions): AppResult<Uri?> =
+                  suspendCancellableCoroutine { cont ->
+                      val capture = imageCapture
+                      if (capture == null) {
+                          cont.resume(AppResult.Error("Caméra non prête")); return@suspendCancellableCoroutine
+                      }
+                      capture.takePicture(options, ContextCompat.getMainExecutor(context),
+                          object : ImageCapture.OnImageSavedCallback {
+                              override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                                  if (cont.isActive) cont.resume(AppResult.Success(output.savedUri))
+                              }
+
+                              override fun onError(exception: ImageCaptureException) {
+                                  if (cont.isActive) cont.resume(AppResult.Error(exception.message ?: "Capture échouée", exception))
+                              }
+                          })
+                  }
+
+              /** Réglage du flash pour les photos. */
+              fun setFlash(setting: FlashSetting) {
+                  flashMode = when (setting) {
+                      FlashSetting.OFF -> ImageCapture.FLASH_MODE_OFF
+                      FlashSetting.AUTO -> ImageCapture.FLASH_MODE_AUTO
+                      FlashSetting.ON -> ImageCapture.FLASH_MODE_ON
+                  }
+                  imageCapture?.flashMode = flashMode
+              }
+
+              /** Allume / éteint la torche (lumière continue). */
               fun setTorch(on: Boolean) {
-                  camera?.cameraControl?.enableTorch(on)
+                  torchWanted = on
+                  val cam = camera ?: return
+                  if (cam.cameraInfo.hasFlashUnit()) cam.cameraControl.enableTorch(on)
               }
 
-              /** Indique si l'appareil dispose d'un flash. */
-              fun hasFlash(): Boolean = camera?.cameraInfo?.hasFlashUnit() == true
+              /** Multiplie le zoom courant par [factor] (geste de pincement). */
+              fun scaleZoom(factor: Float) {
+                  val cam = camera ?: return
+                  val z = cam.cameraInfo.zoomState.value ?: return
+                  cam.cameraControl.setZoomRatio((z.zoomRatio * factor).coerceIn(z.minZoomRatio, z.maxZoomRatio))
+              }
+
+              /** Zoom courant (1.0 = aucun). */
+              fun zoomRatio(): Float = camera?.cameraInfo?.zoomState?.value?.zoomRatio ?: 1f
+
+              /** Mise au point et exposition au point touché. */
+              fun focusAt(view: PreviewView, x: Float, y: Float) {
+                  val cam = camera ?: return
+                  val point = view.meteringPointFactory.createPoint(x, y)
+                  val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+                      .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                      .build()
+                  cam.cameraControl.startFocusAndMetering(action)
+              }
+
+              /**
+               * Démarre un enregistrement vers [target] ; [audio] seulement si la permission micro est accordée.
+               * Renvoie false si la caméra vidéo n'est pas prête.
+               */
+              @SuppressLint("MissingPermission")
+              fun startRecording(target: VideoTarget, audio: Boolean, listener: (VideoRecordEvent) -> Unit): Boolean {
+                  val vc = videoCapture ?: return false
+                  if (recording != null) return false
+                  val pending = when {
+                      target.mediaStore != null -> vc.output.prepareRecording(context, target.mediaStore)
+                      target.descriptor != null ->
+                          vc.output.prepareRecording(context, FileDescriptorOutputOptions.Builder(target.descriptor).build())
+                      target.file != null -> vc.output.prepareRecording(context, FileOutputOptions.Builder(target.file).build())
+                      else -> return false
+                  }
+                  val micOk = audio && ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                      PackageManager.PERMISSION_GRANTED
+                  if (micOk) pending.withAudioEnabled()
+                  recording = pending.start(ContextCompat.getMainExecutor(context)) { event ->
+                      if (event is VideoRecordEvent.Finalize) recording = null
+                      listener(event)
+                  }
+                  return true
+              }
+
+              /** Arrête l'enregistrement en cours (le fichier est finalisé par l'événement Finalize). */
+              fun stopRecording() {
+                  recording?.stop()
+              }
 
               /** Délie la caméra et libère les ressources. */
               fun release() {
+                  recording?.stop()
+                  recording = null
                   analysis?.clearAnalyzer()
                   provider?.unbindAll()
                   analysisExecutor.shutdown()
@@ -454,7 +651,83 @@ jobs:
           }
           DSP_EOF_8
           mkdir -p 'app/src/main/java/com/docscan/pro/core/camera'
-          cat > 'app/src/main/java/com/docscan/pro/core/camera/FrameAnalyzer.kt' << 'DSP_EOF_9'
+          cat > 'app/src/main/java/com/docscan/pro/core/camera/FaceAnalyzer.kt' << 'DSP_EOF_9'
+          package com.docscan.pro.core.camera
+
+          import android.os.SystemClock
+          import androidx.annotation.OptIn
+          import androidx.camera.core.ExperimentalGetImage
+          import androidx.camera.core.ImageProxy
+          import com.docscan.pro.data.model.FaceBox
+          import com.docscan.pro.data.model.FaceResult
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.face.FaceDetection
+          import com.google.mlkit.vision.face.FaceDetectorOptions
+
+          /**
+           * Détection des visages en temps réel (ML Kit, modèle embarqué, hors ligne).
+           * Environ 8 analyses/s ; rectangles normalisés (0..1) dans l'image redressée.
+           */
+          class FaceAnalyzer(private val onFaces: (FaceResult) -> Unit) {
+
+              private val detector = FaceDetection.getClient(
+                  FaceDetectorOptions.Builder()
+                      .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                      .setMinFaceSize(0.1f)
+                      .enableTracking()
+                      .build()
+              )
+
+              @Volatile private var busy = false
+              private var lastRun = 0L
+
+              /**
+               * Lance l'analyse de [image]. Renvoie true si l'image est prise en charge
+               * (elle sera fermée à la fin) ; false si l'appelant doit la fermer.
+               */
+              @OptIn(ExperimentalGetImage::class)
+              fun analyze(image: ImageProxy): Boolean {
+                  val now = SystemClock.elapsedRealtime()
+                  if (busy || now - lastRun < MIN_INTERVAL_MS) return false
+                  val media = image.image ?: return false
+                  busy = true
+                  lastRun = now
+                  val rotation = image.imageInfo.rotationDegrees
+                  val w = (if (rotation % 180 == 0) image.width else image.height).toFloat()
+                  val h = (if (rotation % 180 == 0) image.height else image.width).toFloat()
+                  detector.process(InputImage.fromMediaImage(media, rotation))
+                      .addOnSuccessListener { faces ->
+                          val boxes = faces.map { f ->
+                              val r = f.boundingBox
+                              FaceBox(
+                                  left = (r.left / w).coerceIn(0f, 1f),
+                                  top = (r.top / h).coerceIn(0f, 1f),
+                                  right = (r.right / w).coerceIn(0f, 1f),
+                                  bottom = (r.bottom / h).coerceIn(0f, 1f),
+                                  trackingId = f.trackingId
+                              )
+                          }
+                          onFaces(FaceResult(boxes, w.toInt(), h.toInt()))
+                      }
+                      .addOnCompleteListener {
+                          busy = false
+                          image.close()
+                      }
+                  return true
+              }
+
+              /** Libère le détecteur. */
+              fun close() {
+                  runCatching { detector.close() }
+              }
+
+              private companion object {
+                  const val MIN_INTERVAL_MS = 120L
+              }
+          }
+          DSP_EOF_9
+          mkdir -p 'app/src/main/java/com/docscan/pro/core/camera'
+          cat > 'app/src/main/java/com/docscan/pro/core/camera/FrameAnalyzer.kt' << 'DSP_EOF_10'
           package com.docscan.pro.core.camera
 
           import androidx.camera.core.ImageAnalysis
@@ -470,12 +743,15 @@ jobs:
           import kotlin.math.max
 
           /**
-           * Analyseur CameraX : plan Y (YUV_420_888) → Mat niveaux de gris, rotation
-           * selon l'orientation, réduction à 640 px, détection du document.
-           * Cadence limitée à ~15 images/s.
+           * Analyseur CameraX unique, aiguillé selon le mode :
+           * - Documents : plan Y (YUV_420_888) → Mat gris, rotation, 640 px, détection du document (~15 im/s) ;
+           * - Photo : détection des visages ML Kit ([faceAnalyzer]) si [faceEnabled].
            */
           class FrameAnalyzer(
               private val detector: DocumentDetector,
+              private val enabled: () -> Boolean = { true },
+              private val faceAnalyzer: FaceAnalyzer? = null,
+              private val faceEnabled: () -> Boolean = { false },
               private val onResult: (FrameResult) -> Unit
           ) : ImageAnalysis.Analyzer {
 
@@ -483,9 +759,15 @@ jobs:
               private var buffer = ByteArray(0)
 
               override fun analyze(image: ImageProxy) {
+                  if (faceAnalyzer != null && faceEnabled()) {
+                      // L'analyseur de visages ferme l'image lui-même quand ML Kit a terminé.
+                      val taken = try { faceAnalyzer.analyze(image) } catch (e: Throwable) { false }
+                      if (!taken) image.close()
+                      return
+                  }
                   try {
                       val now = System.currentTimeMillis()
-                      if (now - lastRun < MIN_INTERVAL_MS || !OpenCvInit.ensure()) return
+                      if (!enabled() || now - lastRun < MIN_INTERVAL_MS || !OpenCvInit.ensure()) return
                       lastRun = now
                       val gray = toGrayMat(image)
                       try {
@@ -549,9 +831,9 @@ jobs:
                   const val TARGET_SIDE = 640
               }
           }
-          DSP_EOF_9
+          DSP_EOF_10
           mkdir -p 'app/src/main/java/com/docscan/pro/core/cv'
-          cat > 'app/src/main/java/com/docscan/pro/core/cv/DocumentDetector.kt' << 'DSP_EOF_10'
+          cat > 'app/src/main/java/com/docscan/pro/core/cv/DocumentDetector.kt' << 'DSP_EOF_11'
           package com.docscan.pro.core.cv
 
           import android.graphics.Bitmap
@@ -600,34 +882,69 @@ jobs:
           @Singleton
           class DocumentDetector @Inject constructor() {
 
-              /** Détecte un document sur une image en niveaux de gris (CV_8UC1). Coordonnées normalisées. */
-              fun detect(gray: Mat): Detection? {
+              /**
+               * Détecte un document sur une image en niveaux de gris (CV_8UC1). Coordonnées normalisées.
+               * Deux cartes de contours sont essayées : Canny adaptatif, puis seuillage d'Otsu
+               * (feuille claire sur fond sombre) ; la meilleure confiance l'emporte.
+               */
+              fun detect(gray: Mat, minAreaRatio: Double = MIN_AREA_RATIO): Detection? {
                   if (!OpenCvInit.ensure() || gray.empty()) return null
-                  val w = gray.cols().toDouble()
-                  val h = gray.rows().toDouble()
-                  val frameArea = w * h
                   val blurred = Mat()
-                  val edges = Mat()
-                  val kernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
-                  val hierarchy = Mat()
-                  val contours = ArrayList<MatOfPoint>()
+                  val k3 = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
+                  val k5 = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(5.0, 5.0))
+                  val maps = ArrayList<Mat>()
                   try {
                       Imgproc.GaussianBlur(gray, blurred, Size(5.0, 5.0), 0.0)
+                      // 1) Canny à seuils adaptatifs (médiane).
                       val median = median(blurred)
                       val lower = (0.66 * median).coerceIn(30.0, 100.0)
                       val upper = (1.33 * median).coerceIn(100.0, 200.0)
+                      val edges = Mat()
+                      maps += edges
                       Imgproc.Canny(blurred, edges, lower, upper)
-                      Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, kernel)
-                      Imgproc.dilate(edges, edges, kernel)
-                      Imgproc.findContours(edges, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+                      Imgproc.morphologyEx(edges, edges, Imgproc.MORPH_CLOSE, k3)
+                      Imgproc.dilate(edges, edges, k3)
+                      // 2) Seuillage d'Otsu : la feuille ressort comme une grande zone claire.
+                      val bin = Mat()
+                      maps += bin
+                      Imgproc.threshold(blurred, bin, 0.0, 255.0, Imgproc.THRESH_BINARY or Imgproc.THRESH_OTSU)
+                      Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_CLOSE, k5)
+                      Imgproc.morphologyEx(bin, bin, Imgproc.MORPH_OPEN, k5)
 
+                      var best: Detection? = null
+                      for (m in maps) {
+                          val d = bestQuad(m, gray, minAreaRatio)
+                          if (d != null && (best == null || d.confidence > best.confidence)) best = d
+                      }
+                      return best
+                  } finally {
+                      blurred.release(); k3.release(); k5.release()
+                      maps.forEach { it.release() }
+                  }
+              }
+
+              private fun bestQuad(edgeMap: Mat, gray: Mat, minAreaRatio: Double): Detection? {
+                  val w = gray.cols().toDouble()
+                  val h = gray.rows().toDouble()
+                  val frameArea = w * h
+                  val hierarchy = Mat()
+                  val contours = ArrayList<MatOfPoint>()
+                  try {
+                      Imgproc.findContours(edgeMap, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
                       var best: Detection? = null
                       val sorted = contours.sortedByDescending { Imgproc.contourArea(it) }.take(5)
                       for (c in sorted) {
                           val area = Imgproc.contourArea(c)
-                          if (area < MIN_AREA_RATIO * frameArea) break
-                          val corners = approxQuad(c) ?: continue
-                          val score = confidence(gray, corners, area, frameArea, c)
+                          if (area < minAreaRatio * frameArea) break
+                          if (area > 0.985 * frameArea) continue // bord de l'image, pas une feuille
+                          var corners = approxQuad(c)
+                          var penalty = 1.0
+                          if (corners == null) {
+                              // Coins masqués ou arrondis : rectangle minimal englobant.
+                              corners = minRectCorners(c, w, h)
+                              penalty = 0.85
+                          }
+                          val score = confidence(gray, corners, area, frameArea, c) * penalty
                           if (best == null || score > best.confidence) {
                               best = Detection(
                                   Quad.fromUnordered(corners.map { Pt((it.x / w).toFloat(), (it.y / h).toFloat()) }),
@@ -637,21 +954,30 @@ jobs:
                       }
                       return best
                   } finally {
-                      blurred.release(); edges.release(); kernel.release(); hierarchy.release()
+                      hierarchy.release()
                       contours.forEach { it.release() }
                   }
               }
 
-              /** Détecte un document sur un bitmap (réduit à 800 px pour la vitesse). */
+              private fun minRectCorners(contour: MatOfPoint, w: Double, h: Double): List<Point> {
+                  val c2f = MatOfPoint2f(*contour.toArray())
+                  val rect = Imgproc.minAreaRect(c2f)
+                  c2f.release()
+                  val pts = arrayOfNulls<Point>(4)
+                  rect.points(pts)
+                  return pts.map { p -> Point(p!!.x.coerceIn(0.0, w - 1), p.y.coerceIn(0.0, h - 1)) }
+              }
+
+              /** Détecte un document sur une photo (réduite à 1000 px ; aire minimale 12 %). */
               fun detect(bitmap: Bitmap): Detection? {
                   if (!OpenCvInit.ensure()) return null
-                  val small = com.docscan.pro.core.utils.BitmapUtils.scaledCopy(bitmap, 800)
+                  val small = com.docscan.pro.core.utils.BitmapUtils.scaledCopy(bitmap, 1000)
                   val rgba = Mat()
                   val gray = Mat()
                   return try {
                       Utils.bitmapToMat(small, rgba)
                       Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
-                      detect(gray)
+                      detect(gray, STILL_MIN_AREA_RATIO)
                   } finally {
                       rgba.release(); gray.release(); small.recycle()
                   }
@@ -752,13 +1078,15 @@ jobs:
               companion object {
                   /** Aire minimale du document par rapport à l'image. */
                   const val MIN_AREA_RATIO = 0.25
+                  /** Aire minimale sur une photo déjà prise. */
+                  const val STILL_MIN_AREA_RATIO = 0.12
                   /** Seuil de confiance pour considérer la détection valide. */
                   const val CONFIDENCE_THRESHOLD = 0.7f
               }
           }
-          DSP_EOF_10
+          DSP_EOF_11
           mkdir -p 'app/src/main/java/com/docscan/pro/core/cv'
-          cat > 'app/src/main/java/com/docscan/pro/core/cv/ImageEnhancer.kt' << 'DSP_EOF_11'
+          cat > 'app/src/main/java/com/docscan/pro/core/cv/ImageEnhancer.kt' << 'DSP_EOF_12'
           package com.docscan.pro.core.cv
 
           import android.graphics.Bitmap
@@ -969,9 +1297,9 @@ jobs:
                   return w
               }
           }
-          DSP_EOF_11
+          DSP_EOF_12
           mkdir -p 'app/src/main/java/com/docscan/pro/core/cv'
-          cat > 'app/src/main/java/com/docscan/pro/core/cv/PerspectiveCorrector.kt' << 'DSP_EOF_12'
+          cat > 'app/src/main/java/com/docscan/pro/core/cv/PerspectiveCorrector.kt' << 'DSP_EOF_13'
           package com.docscan.pro.core.cv
 
           import android.graphics.Bitmap
@@ -1024,9 +1352,9 @@ jobs:
 
               private fun dist(a: Point, b: Point) = hypot(a.x - b.x, a.y - b.y)
           }
-          DSP_EOF_12
+          DSP_EOF_13
           mkdir -p 'app/src/main/java/com/docscan/pro/core/ocr'
-          cat > 'app/src/main/java/com/docscan/pro/core/ocr/OcrEngine.kt' << 'DSP_EOF_13'
+          cat > 'app/src/main/java/com/docscan/pro/core/ocr/OcrEngine.kt' << 'DSP_EOF_14'
           package com.docscan.pro.core.ocr
 
           import com.docscan.pro.core.utils.BitmapUtils
@@ -1053,9 +1381,9 @@ jobs:
                   }
               }
           }
-          DSP_EOF_13
+          DSP_EOF_14
           mkdir -p 'app/src/main/java/com/docscan/pro/core/utils'
-          cat > 'app/src/main/java/com/docscan/pro/core/utils/AndroidUtils.kt' << 'DSP_EOF_14'
+          cat > 'app/src/main/java/com/docscan/pro/core/utils/AndroidUtils.kt' << 'DSP_EOF_15'
           package com.docscan.pro.core.utils
 
           import android.app.Activity
@@ -1102,6 +1430,19 @@ jobs:
                           .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                   } catch (e: ActivityNotFoundException) {
                       Toast.makeText(context, R.string.error_no_pdf_app, Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              /** Ouvre une photo ou une vidéo dans la visionneuse du téléphone. */
+              fun viewMedia(context: Context, uri: android.net.Uri, mime: String) {
+                  val intent = Intent(Intent.ACTION_VIEW).apply {
+                      setDataAndType(uri, mime)
+                      addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                  }
+                  try {
+                      context.startActivity(intent)
+                  } catch (e: ActivityNotFoundException) {
+                      Toast.makeText(context, R.string.error_no_viewer, Toast.LENGTH_LONG).show()
                   }
               }
 
@@ -1162,9 +1503,9 @@ jobs:
                   }
               }
           }
-          DSP_EOF_14
+          DSP_EOF_15
           mkdir -p 'app/src/main/java/com/docscan/pro/core/utils'
-          cat > 'app/src/main/java/com/docscan/pro/core/utils/BitmapUtils.kt' << 'DSP_EOF_15'
+          cat > 'app/src/main/java/com/docscan/pro/core/utils/BitmapUtils.kt' << 'DSP_EOF_16'
           package com.docscan.pro.core.utils
 
           import android.graphics.Bitmap
@@ -1177,16 +1518,17 @@ jobs:
           /** Utilitaires de décodage et de transformation de bitmaps. */
           object BitmapUtils {
 
-              /** Côté long maximal conservé pour les captures (≈ 8 Mpx en 4:3). */
-              const val MAX_SIDE = 3264
+              /** Côté long maximal conservé pour les captures (≈ 12,5 Mpx en 4:3). */
+              const val MAX_SIDE = 4096
 
               /** Décode [path] en ARGB_8888, applique l'orientation EXIF et limite à [maxSide]. */
               fun decodeOriented(path: String, maxSide: Int = MAX_SIDE): Bitmap {
                   val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                   BitmapFactory.decodeFile(path, bounds)
                   require(bounds.outWidth > 0 && bounds.outHeight > 0) { "Image illisible" }
+                  // Sous-échantillonnage tant que l'image reste ≥ 1,5 × la cible (évite les bitmaps géants en 50/108 Mpx).
                   var sample = 1
-                  while (max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxSide) sample *= 2
+                  while (max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxSide * 3 / 4) sample *= 2
                   val opts = BitmapFactory.Options().apply {
                       inSampleSize = sample
                       inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -1245,9 +1587,9 @@ jobs:
                   0
               }
           }
-          DSP_EOF_15
+          DSP_EOF_16
           mkdir -p 'app/src/main/java/com/docscan/pro/core/utils'
-          cat > 'app/src/main/java/com/docscan/pro/core/utils/CryptoManager.kt' << 'DSP_EOF_16'
+          cat > 'app/src/main/java/com/docscan/pro/core/utils/CryptoManager.kt' << 'DSP_EOF_17'
           package com.docscan.pro.core.utils
 
           import android.content.Context
@@ -1280,9 +1622,9 @@ jobs:
                   encrypted(source).openFileInput().use { input -> target.outputStream().use { input.copyTo(it) } }
               }
           }
-          DSP_EOF_16
+          DSP_EOF_17
           mkdir -p 'app/src/main/java/com/docscan/pro/core/utils'
-          cat > 'app/src/main/java/com/docscan/pro/core/utils/FileUtils.kt' << 'DSP_EOF_17'
+          cat > 'app/src/main/java/com/docscan/pro/core/utils/FileUtils.kt' << 'DSP_EOF_18'
           package com.docscan.pro.core.utils
 
           import android.content.Context
@@ -1373,9 +1715,241 @@ jobs:
                       name.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "Scan" }.take(80)
               }
           }
-          DSP_EOF_17
+          DSP_EOF_18
           mkdir -p 'app/src/main/java/com/docscan/pro/core/utils'
-          cat > 'app/src/main/java/com/docscan/pro/core/utils/PdfExporter.kt' << 'DSP_EOF_18'
+          cat > 'app/src/main/java/com/docscan/pro/core/utils/GalleryStore.kt' << 'DSP_EOF_19'
+          package com.docscan.pro.core.utils
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.media.MediaScannerConnection
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.os.ParcelFileDescriptor
+          import android.provider.DocumentsContract
+          import android.provider.MediaStore
+          import androidx.camera.core.ImageCapture
+          import androidx.camera.video.MediaStoreOutputOptions
+          import androidx.core.content.FileProvider
+          import androidx.documentfile.provider.DocumentFile
+          import com.docscan.pro.data.model.PhotoDestination
+          import dagger.hilt.android.qualifiers.ApplicationContext
+          import java.io.File
+          import java.io.OutputStream
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          import javax.inject.Inject
+          import javax.inject.Singleton
+
+          /** Cible d'une prise de vue : options CameraX + ce qu'il faut finaliser après la capture. */
+          class PhotoTarget(
+              val options: ImageCapture.OutputFileOptions,
+              /** Fichier direct (Android 8-9). */
+              val legacyFile: File?,
+              /** Document créé dans un dossier choisi par l'utilisateur. */
+              val documentUri: Uri?,
+              /** Flux ouvert vers [documentUri], fermé par [GalleryStore.finish]. */
+              val stream: OutputStream?
+          )
+
+          /** Cible d'un enregistrement vidéo (un seul des trois supports est rempli). */
+          class VideoTarget(
+              val mediaStore: MediaStoreOutputOptions?,
+              val file: File?,
+              val descriptor: ParcelFileDescriptor?,
+              val documentUri: Uri?
+          )
+
+          /**
+           * Enregistrement des photos selon le réglage de l'utilisateur :
+           * - Images : « Pictures/DocScan Pro »
+           * - DCIM : « DCIM/Camera », avec les photos du téléphone
+           * - Dossier choisi : n'importe quel dossier sélectionné dans les réglages (SAF)
+           */
+          @Singleton
+          class GalleryStore @Inject constructor(@ApplicationContext private val context: Context) {
+
+              /** Nom horodaté d'une nouvelle photo. */
+              fun newName(prefix: String = "IMG"): String =
+                  prefix + "_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+
+              private fun relativePath(dest: PhotoDestination, video: Boolean = false): String = when {
+                  dest == PhotoDestination.DCIM -> Environment.DIRECTORY_DCIM + "/Camera"
+                  video -> Environment.DIRECTORY_MOVIES + "/DocScan Pro"
+                  else -> Environment.DIRECTORY_PICTURES + "/DocScan Pro"
+              }
+
+              private fun appMoviesDir(): File =
+                  File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: context.filesDir, "DocScan Pro").apply { mkdirs() }
+
+              private fun appPicturesDir(): File =
+                  File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: context.filesDir, "DocScan Pro").apply { mkdirs() }
+
+              /** Dossier direct sur Android 8-9 (DCIM si accessible en écriture, sinon dossier de l'app). */
+              @Suppress("DEPRECATION")
+              private fun legacyDir(dest: PhotoDestination): File {
+                  if (dest == PhotoDestination.DCIM) {
+                      val dcim = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "Camera")
+                      if ((dcim.exists() || dcim.mkdirs()) && dcim.canWrite()) return dcim
+                  }
+                  return appPicturesDir()
+              }
+
+              /** Uri partageable d'un fichier local. */
+              fun uriForFile(file: File): Uri = try {
+                  FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+              } catch (e: IllegalArgumentException) {
+                  Uri.fromFile(file)
+              }
+
+              /** Nom lisible du dossier choisi, ou null. */
+              fun folderName(treeUri: String?): String? = try {
+                  treeUri?.let { DocumentFile.fromTreeUri(context, Uri.parse(it))?.name }
+              } catch (e: Exception) {
+                  null
+              }
+
+              /** Crée un fichier vide dans le dossier choisi ; null si le dossier n'est plus accessible. */
+              private fun createInTree(treeUri: String?, name: String, mime: String = "image/jpeg"): Uri? = try {
+                  val dir = treeUri?.let { DocumentFile.fromTreeUri(context, Uri.parse(it)) }
+                  if (dir != null && dir.canWrite()) dir.createFile(mime, name)?.uri else null
+              } catch (e: Exception) {
+                  null
+              }
+
+              /** Prépare la cible de la prochaine photo. */
+              fun photoOutput(dest: PhotoDestination, treeUri: String?): PhotoTarget {
+                  val name = newName()
+                  if (dest == PhotoDestination.CUSTOM) {
+                      val doc = createInTree(treeUri, name)
+                      val stream = doc?.let { runCatching { context.contentResolver.openOutputStream(it) }.getOrNull() }
+                      if (doc != null && stream != null) {
+                          return PhotoTarget(ImageCapture.OutputFileOptions.Builder(stream).build(), null, doc, stream)
+                      }
+                      doc?.let { delete(it) }
+                  }
+                  val fallback = if (dest == PhotoDestination.CUSTOM) PhotoDestination.PICTURES else dest
+                  return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Images.Media.DISPLAY_NAME, "$name.jpg")
+                          put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                          put(MediaStore.Images.Media.RELATIVE_PATH, relativePath(fallback))
+                      }
+                      PhotoTarget(
+                          ImageCapture.OutputFileOptions.Builder(
+                              context.contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
+                          ).build(),
+                          null, null, null
+                      )
+                  } else {
+                      val file = File(legacyDir(fallback), "$name.jpg")
+                      PhotoTarget(ImageCapture.OutputFileOptions.Builder(file).build(), file, null, null)
+                  }
+              }
+
+              /** Finalise après la capture ; renvoie l'Uri de la photo (null si échec). */
+              fun finish(target: PhotoTarget, success: Boolean, savedUri: Uri?): Uri? {
+                  runCatching { target.stream?.close() }
+                  if (!success) {
+                      target.documentUri?.let { delete(it) }
+                      target.legacyFile?.delete()
+                      return null
+                  }
+                  target.legacyFile?.let { scan(it) }
+                  return target.documentUri ?: savedUri ?: target.legacyFile?.let { uriForFile(it) }
+              }
+
+              /** Prépare la cible de la prochaine vidéo (même dossier que les photos ; Movies pour « Images »). */
+              fun videoOutput(dest: PhotoDestination, treeUri: String?): VideoTarget {
+                  val name = newName("VID")
+                  if (dest == PhotoDestination.CUSTOM) {
+                      val doc = createInTree(treeUri, name, "video/mp4")
+                      val pfd = doc?.let { runCatching { context.contentResolver.openFileDescriptor(it, "rw") }.getOrNull() }
+                      if (doc != null && pfd != null) return VideoTarget(null, null, pfd, doc)
+                      doc?.let { delete(it) }
+                  }
+                  val fallback = if (dest == PhotoDestination.CUSTOM) PhotoDestination.PICTURES else dest
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Video.Media.DISPLAY_NAME, "$name.mp4")
+                          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                          put(MediaStore.Video.Media.RELATIVE_PATH, relativePath(fallback, video = true))
+                      }
+                      val options = MediaStoreOutputOptions.Builder(context.contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                          .setContentValues(values)
+                          .build()
+                      return VideoTarget(options, null, null, null)
+                  }
+                  val dir = if (fallback == PhotoDestination.DCIM) legacyDir(fallback) else appMoviesDir()
+                  return VideoTarget(null, File(dir, "$name.mp4"), null, null)
+              }
+
+              /** Finalise une vidéo ; renvoie son Uri (null si échec). */
+              fun finishVideo(target: VideoTarget, success: Boolean, savedUri: Uri?): Uri? {
+                  runCatching { target.descriptor?.close() }
+                  if (!success) {
+                      target.documentUri?.let { delete(it) }
+                      target.file?.delete()
+                      return null
+                  }
+                  target.file?.let {
+                      MediaScannerConnection.scanFile(context, arrayOf(it.absolutePath), arrayOf("video/mp4"), null)
+                  }
+                  return target.documentUri ?: savedUri?.takeIf { it != Uri.EMPTY } ?: target.file?.let { uriForFile(it) }
+              }
+
+              private fun delete(uri: Uri) {
+                  runCatching { DocumentsContract.deleteDocument(context.contentResolver, uri) }
+              }
+
+              private fun scan(file: File) {
+                  MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), arrayOf("image/jpeg"), null)
+              }
+
+              /** Copie une image JPEG vers le dossier des photos et renvoie son Uri. */
+              fun saveToGallery(src: File, baseName: String, dest: PhotoDestination, treeUri: String?): Uri {
+                  if (dest == PhotoDestination.CUSTOM) {
+                      val doc = createInTree(treeUri, baseName)
+                      if (doc != null) {
+                          context.contentResolver.openOutputStream(doc).use { out ->
+                              requireNotNull(out) { "Dossier inaccessible" }
+                              src.inputStream().use { it.copyTo(out) }
+                          }
+                          return doc
+                      }
+                  }
+                  val fallback = if (dest == PhotoDestination.CUSTOM) PhotoDestination.PICTURES else dest
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val resolver = context.contentResolver
+                      val values = ContentValues().apply {
+                          put(MediaStore.Images.Media.DISPLAY_NAME, "$baseName.jpg")
+                          put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                          put(MediaStore.Images.Media.RELATIVE_PATH, relativePath(fallback))
+                          put(MediaStore.Images.Media.IS_PENDING, 1)
+                      }
+                      val uri = requireNotNull(resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)) {
+                          "Galerie indisponible"
+                      }
+                      resolver.openOutputStream(uri).use { out ->
+                          requireNotNull(out) { "Galerie indisponible" }
+                          src.inputStream().use { it.copyTo(out) }
+                      }
+                      values.clear()
+                      values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                      resolver.update(uri, values, null, null)
+                      return uri
+                  }
+                  val target = File(legacyDir(fallback), "$baseName.jpg")
+                  src.copyTo(target, overwrite = true)
+                  scan(target)
+                  return uriForFile(target)
+              }
+          }
+          DSP_EOF_19
+          mkdir -p 'app/src/main/java/com/docscan/pro/core/utils'
+          cat > 'app/src/main/java/com/docscan/pro/core/utils/PdfExporter.kt' << 'DSP_EOF_20'
           package com.docscan.pro.core.utils
 
           import android.graphics.Color
@@ -1426,9 +2000,9 @@ jobs:
                   }
               }
           }
-          DSP_EOF_18
+          DSP_EOF_20
           mkdir -p 'app/src/main/java/com/docscan/pro/data/local'
-          cat > 'app/src/main/java/com/docscan/pro/data/local/Database.kt' << 'DSP_EOF_19'
+          cat > 'app/src/main/java/com/docscan/pro/data/local/Database.kt' << 'DSP_EOF_21'
           package com.docscan.pro.data.local
 
           import androidx.room.Dao
@@ -1515,9 +2089,9 @@ jobs:
               /** DAO des documents. */
               abstract fun documentDao(): DocumentDao
           }
-          DSP_EOF_19
+          DSP_EOF_21
           mkdir -p 'app/src/main/java/com/docscan/pro/data/model'
-          cat > 'app/src/main/java/com/docscan/pro/data/model/Models.kt' << 'DSP_EOF_20'
+          cat > 'app/src/main/java/com/docscan/pro/data/model/Models.kt' << 'DSP_EOF_22'
           package com.docscan.pro.data.model
 
           import kotlin.math.abs
@@ -1590,6 +2164,34 @@ jobs:
               }
           }
 
+          /** Modes de l'appareil photo. */
+          enum class CameraMode { DOCUMENT, VIDEO, PHOTO }
+
+          /** Réglage du flash en mode Photo. */
+          enum class FlashSetting { OFF, AUTO, ON }
+
+          /**
+           * Qualité vidéo : résolution + débit cible (bits/s).
+           * Le débit maîtrisé donne une image nette pour un fichier 3 à 5 fois plus léger
+           * que l'enregistrement par défaut du téléphone (~17 Mbit/s en 1080p).
+           */
+          enum class VideoQuality(val height: Int, val bitRate: Int) {
+              /** Le plus petit format standard de CameraX est 480p ; avec 1 Mbit/s le poids est celui d'une vidéo 360p. */
+              TINY(480, 1_000_000),
+              LIGHT(720, 3_000_000),
+              BALANCED(1080, 6_000_000),
+              HIGH(1080, 10_000_000);
+
+              /** Taille estimée en Mo par minute (image + son). */
+              val mbPerMinute: Int get() = ((bitRate + 128_000) * 60L / 8 / 1_000_000).toInt()
+          }
+
+          /** Dossier d'enregistrement des photos. */
+          enum class PhotoDestination { PICTURES, DCIM, CUSTOM }
+
+          /** Format d'export d'un scan. */
+          enum class ExportFormat { PDF, JPG }
+
           /** Filtres de rendu disponibles. */
           enum class ScanFilter { ORIGINAL, DOCUMENT, HANDWRITING, SKETCH, BW, COLOR }
 
@@ -1636,11 +2238,29 @@ jobs:
           data class AppSettings(
               val autoCapture: Boolean = true,
               val defaultFilter: ScanFilter = ScanFilter.DOCUMENT,
-              val pdfQuality: PdfQuality = PdfQuality.MEDIUM
+              val pdfQuality: PdfQuality = PdfQuality.MEDIUM,
+              val lastMode: CameraMode = CameraMode.DOCUMENT,
+              val photoDest: PhotoDestination = PhotoDestination.PICTURES,
+              /** Dossier choisi par l'utilisateur (Uri d'arborescence SAF), si CUSTOM. */
+              val photoTreeUri: String? = null,
+              val lastPhotoUri: String? = null,
+              val lastMediaIsVideo: Boolean = false,
+              val videoQuality: VideoQuality = VideoQuality.BALANCED,
+              val faceDetection: Boolean = true
           )
 
           /** Résultat de détection d'un document sur une image. */
           data class Detection(val quad: Quad, val confidence: Float)
+
+          /** Visage détecté : rectangle normalisé (0..1) dans l'image redressée. */
+          data class FaceBox(val left: Float, val top: Float, val right: Float, val bottom: Float, val trackingId: Int?) {
+              val centerX: Float get() = (left + right) / 2f
+              val centerY: Float get() = (top + bottom) / 2f
+              val area: Float get() = (right - left) * (bottom - top)
+          }
+
+          /** Visages d'une frame. */
+          data class FaceResult(val faces: List<FaceBox>, val frameWidth: Int, val frameHeight: Int)
 
           /** Résultat d'analyse d'une frame caméra. */
           data class FrameResult(
@@ -1667,9 +2287,9 @@ jobs:
           } catch (e: Throwable) {
               AppResult.Error(e.message ?: e.javaClass.simpleName, e)
           }
-          DSP_EOF_20
+          DSP_EOF_22
           mkdir -p 'app/src/main/java/com/docscan/pro/data/repository'
-          cat > 'app/src/main/java/com/docscan/pro/data/repository/Repositories.kt' << 'DSP_EOF_21'
+          cat > 'app/src/main/java/com/docscan/pro/data/repository/Repositories.kt' << 'DSP_EOF_23'
           package com.docscan.pro.data.repository
 
           import android.content.Context
@@ -1686,6 +2306,9 @@ jobs:
           import com.docscan.pro.data.local.DocumentWithPages
           import com.docscan.pro.data.local.PageEntity
           import com.docscan.pro.data.model.AppSettings
+          import com.docscan.pro.data.model.CameraMode
+          import com.docscan.pro.data.model.PhotoDestination
+          import com.docscan.pro.data.model.VideoQuality
           import com.docscan.pro.data.model.Document
           import com.docscan.pro.data.model.DocumentType
           import com.docscan.pro.data.model.DraftPage
@@ -1716,13 +2339,27 @@ jobs:
               private val keyAuto = booleanPreferencesKey("auto_capture")
               private val keyFilter = stringPreferencesKey("default_filter")
               private val keyQuality = stringPreferencesKey("pdf_quality")
+              private val keyMode = stringPreferencesKey("last_mode")
+              private val keyDest = stringPreferencesKey("photo_dest")
+              private val keyTree = stringPreferencesKey("photo_tree")
+              private val keyLastPhoto = stringPreferencesKey("last_photo")
+              private val keyLastIsVideo = booleanPreferencesKey("last_is_video")
+              private val keyVideoQuality = stringPreferencesKey("video_quality")
+              private val keyFaces = booleanPreferencesKey("face_detection")
 
               /** Flux des préférences. */
               val settings: Flow<AppSettings> = context.dataStore.data.map { p ->
                   AppSettings(
                       autoCapture = p[keyAuto] ?: true,
                       defaultFilter = enumOr(p[keyFilter], ScanFilter.DOCUMENT),
-                      pdfQuality = enumOr(p[keyQuality], PdfQuality.MEDIUM)
+                      pdfQuality = enumOr(p[keyQuality], PdfQuality.MEDIUM),
+                      lastMode = enumOr(p[keyMode], CameraMode.DOCUMENT),
+                      photoDest = enumOr(p[keyDest], PhotoDestination.PICTURES),
+                      photoTreeUri = p[keyTree],
+                      lastPhotoUri = p[keyLastPhoto],
+                      lastMediaIsVideo = p[keyLastIsVideo] ?: false,
+                      videoQuality = enumOr(p[keyVideoQuality], VideoQuality.BALANCED),
+                      faceDetection = p[keyFaces] ?: true
                   )
               }
 
@@ -1737,6 +2374,31 @@ jobs:
 
               /** Qualité d'export PDF par défaut. */
               suspend fun setPdfQuality(v: PdfQuality) { context.dataStore.edit { it[keyQuality] = v.name } }
+
+              /** Dernier mode caméra utilisé. */
+              suspend fun setLastMode(v: CameraMode) { context.dataStore.edit { it[keyMode] = v.name } }
+
+              /** Dossier des photos : Images, DCIM ou dossier choisi ([treeUri]). */
+              suspend fun setPhotoDestination(dest: PhotoDestination, treeUri: String? = null) {
+                  context.dataStore.edit {
+                      it[keyDest] = dest.name
+                      if (treeUri != null) it[keyTree] = treeUri
+                  }
+              }
+
+              /** Mémorise la dernière photo prise (vignette). */
+              suspend fun setLastPhoto(uri: String, isVideo: Boolean = false) {
+                  context.dataStore.edit {
+                      it[keyLastPhoto] = uri
+                      it[keyLastIsVideo] = isVideo
+                  }
+              }
+
+              /** Détection des visages en mode Photo. */
+              suspend fun setFaceDetection(v: Boolean) { context.dataStore.edit { it[keyFaces] = v } }
+
+              /** Qualité des vidéos. */
+              suspend fun setVideoQuality(v: VideoQuality) { context.dataStore.edit { it[keyVideoQuality] = v.name } }
 
               private inline fun <reified E : Enum<E>> enumOr(name: String?, default: E): E =
                   name?.let { n -> enumValues<E>().firstOrNull { it.name == n } } ?: default
@@ -1851,14 +2513,15 @@ jobs:
                   }
               )
           }
-          DSP_EOF_21
+          DSP_EOF_23
           mkdir -p 'app/src/main/java/com/docscan/pro/di'
-          cat > 'app/src/main/java/com/docscan/pro/di/AppModule.kt' << 'DSP_EOF_22'
+          cat > 'app/src/main/java/com/docscan/pro/di/AppModule.kt' << 'DSP_EOF_24'
           package com.docscan.pro.di
 
           import android.content.Context
           import androidx.room.Room
           import com.docscan.pro.core.cv.DocumentDetector
+          import com.docscan.pro.core.utils.GalleryStore
           import com.docscan.pro.data.local.AppDatabase
           import com.docscan.pro.data.local.DocumentDao
           import dagger.Module
@@ -1889,10 +2552,13 @@ jobs:
           interface CameraEntryPoint {
               /** Détecteur de document partagé. */
               fun documentDetector(): DocumentDetector
+
+              /** Enregistrement des photos dans la galerie. */
+              fun galleryStore(): GalleryStore
           }
-          DSP_EOF_22
+          DSP_EOF_24
           mkdir -p 'app/src/main/java/com/docscan/pro/domain/usecase'
-          cat > 'app/src/main/java/com/docscan/pro/domain/usecase/AutoCaptureUseCase.kt' << 'DSP_EOF_23'
+          cat > 'app/src/main/java/com/docscan/pro/domain/usecase/AutoCaptureUseCase.kt' << 'DSP_EOF_25'
           package com.docscan.pro.domain.usecase
 
           import com.docscan.pro.data.model.FrameResult
@@ -1972,12 +2638,15 @@ jobs:
                   const val WINDOW = 5
               }
           }
-          DSP_EOF_23
+          DSP_EOF_25
           mkdir -p 'app/src/main/java/com/docscan/pro/domain/usecase'
-          cat > 'app/src/main/java/com/docscan/pro/domain/usecase/ExportPdfUseCase.kt' << 'DSP_EOF_24'
+          cat > 'app/src/main/java/com/docscan/pro/domain/usecase/ExportPdfUseCase.kt' << 'DSP_EOF_26'
           package com.docscan.pro.domain.usecase
 
           import com.docscan.pro.core.utils.CryptoManager
+          import com.docscan.pro.core.utils.GalleryStore
+          import com.docscan.pro.data.model.ExportFormat
+          import java.io.File
           import com.docscan.pro.core.utils.FileStore
           import com.docscan.pro.core.utils.PdfExporter
           import com.docscan.pro.data.model.AppResult
@@ -1986,6 +2655,7 @@ jobs:
           import com.docscan.pro.data.model.resultOf
           import com.docscan.pro.data.repository.DocumentRepository
           import com.docscan.pro.data.repository.ScanSession
+          import com.docscan.pro.data.repository.SettingsRepository
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.withContext
           import javax.inject.Inject
@@ -1995,25 +2665,39 @@ jobs:
               val name: String,
               val type: DocumentType,
               val quality: PdfQuality,
-              val protect: Boolean
+              val protect: Boolean,
+              val format: ExportFormat = ExportFormat.PDF
           )
 
           /**
-           * Exporte la session en PDF multi-pages, l'enregistre en base et vide la session.
+           * Exporte la session en PDF multi-pages (enregistré en base) ou en images JPG dans la galerie, puis vide la session.
            * Document protégé : PDF chiffré AES-256 en stockage interne, images de pages supprimées.
            */
           class ExportPdfUseCase @Inject constructor(
               private val exporter: PdfExporter,
               private val crypto: CryptoManager,
               private val fileStore: FileStore,
+              private val gallery: GalleryStore,
+              private val settings: SettingsRepository,
               private val repository: DocumentRepository,
               private val session: ScanSession
           ) {
-              /** Lance l'export ; renvoie l'id du document créé. */
+              /** Lance l'export ; renvoie l'id du document créé (0 pour un export en images). */
               suspend operator fun invoke(req: ExportRequest): AppResult<Long> = withContext(Dispatchers.IO) {
                   resultOf {
                       val pages = session.pages.value
                       require(pages.isNotEmpty()) { "Aucune page à exporter" }
+                      if (req.format == ExportFormat.JPG) {
+                          // Images recadrées enregistrées dans la galerie, une par page.
+                          val base = FileStore.sanitize(req.name)
+                          val prefs = settings.current()
+                          pages.forEachIndexed { i, p ->
+                              val suffix = if (pages.size > 1) "_${i + 1}" else ""
+                              gallery.saveToGallery(File(p.processedPath), base + suffix, prefs.photoDest, prefs.photoTreeUri)
+                          }
+                          session.clear(deleteFiles = true)
+                          return@resultOf 0L
+                      }
                       val images = pages.map { it.processedPath }
                       val name = FileStore.sanitize(req.name)
                       val target = if (req.protect) {
@@ -2036,9 +2720,9 @@ jobs:
                   }
               }
           }
-          DSP_EOF_24
+          DSP_EOF_26
           mkdir -p 'app/src/main/java/com/docscan/pro/domain/usecase'
-          cat > 'app/src/main/java/com/docscan/pro/domain/usecase/PageUseCases.kt' << 'DSP_EOF_25'
+          cat > 'app/src/main/java/com/docscan/pro/domain/usecase/PageUseCases.kt' << 'DSP_EOF_27'
           package com.docscan.pro.domain.usecase
 
           import android.graphics.Bitmap
@@ -2083,18 +2767,20 @@ jobs:
                       val bmp = BitmapUtils.decodeOriented(path)
                       try {
                           // Réécrit l'original orienté et réduit : toutes les coordonnées restent cohérentes.
-                          fileStore.saveJpeg(bmp, File(path), 92)
+                          fileStore.saveJpeg(bmp, File(path), 95)
                           val det = detect(bmp)
+                          // Cadrage automatique : détection sur la photo, sinon le cadre vu en direct.
                           val quad = when {
-                              det != null && det.confidence >= 0.5f -> det.quad
+                              det != null && det.confidence >= 0.55f -> det.quad
                               hint != null -> hint
+                              det != null -> det.quad
                               else -> Quad.FULL_INSET
                           }
                           val filter = settings.current().defaultFilter
                           val warped = corrector.warp(bmp, quad)
                           val processed = enhancer.apply(warped, filter)
-                          val warpedPath = fileStore.saveJpeg(warped, fileStore.newImageFile("warp"), 95)
-                          val processedPath = fileStore.saveJpeg(processed, fileStore.newImageFile("proc"), 90)
+                          val warpedPath = fileStore.saveJpeg(warped, fileStore.newImageFile("warp"), 97)
+                          val processedPath = fileStore.saveJpeg(processed, fileStore.newImageFile("proc"), 95)
                           warped.recycle(); processed.recycle()
                           DraftPage(UUID.randomUUID().toString(), path, warpedPath, processedPath, filter, quad)
                       } finally {
@@ -2125,7 +2811,7 @@ jobs:
                       val warped = BitmapUtils.decode(page.warpedPath)
                       val out = enhancer.apply(warped, filter)
                       warped.recycle()
-                      val path = fileStore.saveJpeg(out, fileStore.newImageFile("proc"), 90)
+                      val path = fileStore.saveJpeg(out, fileStore.newImageFile("proc"), 95)
                       out.recycle()
                       page.copy(processedPath = path, filter = filter)
                   }
@@ -2138,8 +2824,8 @@ jobs:
                       val warped = corrector.warp(original, quad)
                       original.recycle()
                       val processed = enhancer.apply(warped, page.filter)
-                      val warpedPath = fileStore.saveJpeg(warped, fileStore.newImageFile("warp"), 95)
-                      val processedPath = fileStore.saveJpeg(processed, fileStore.newImageFile("proc"), 90)
+                      val warpedPath = fileStore.saveJpeg(warped, fileStore.newImageFile("warp"), 97)
+                      val processedPath = fileStore.saveJpeg(processed, fileStore.newImageFile("proc"), 95)
                       warped.recycle(); processed.recycle()
                       page.copy(quad = quad, warpedPath = warpedPath, processedPath = processedPath)
                   }
@@ -2150,19 +2836,24 @@ jobs:
                   resultOf {
                       val w = BitmapUtils.rotate(BitmapUtils.decode(page.warpedPath), 90f)
                       val p = BitmapUtils.rotate(BitmapUtils.decode(page.processedPath), 90f)
-                      val warpedPath = fileStore.saveJpeg(w, fileStore.newImageFile("warp"), 95)
-                      val processedPath = fileStore.saveJpeg(p, fileStore.newImageFile("proc"), 90)
+                      val warpedPath = fileStore.saveJpeg(w, fileStore.newImageFile("warp"), 97)
+                      val processedPath = fileStore.saveJpeg(p, fileStore.newImageFile("proc"), 95)
                       w.recycle(); p.recycle()
                       page.copy(warpedPath = warpedPath, processedPath = processedPath)
                   }
               }
           }
-          DSP_EOF_25
+          DSP_EOF_27
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/camera'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/camera/CameraScreen.kt' << 'DSP_EOF_26'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/camera/CameraScreen.kt' << 'DSP_EOF_28'
           package com.docscan.pro.presentation.camera
 
           import android.Manifest
+          import android.annotation.SuppressLint
+          import android.net.Uri
+          import android.view.GestureDetector
+          import android.view.MotionEvent
+          import android.view.ScaleGestureDetector
           import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.result.PickVisualMediaRequest
           import androidx.activity.result.contract.ActivityResultContracts
@@ -2173,6 +2864,7 @@ jobs:
           import androidx.compose.foundation.background
           import androidx.compose.foundation.border
           import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectHorizontalDragGestures
           import androidx.compose.foundation.layout.Arrangement
           import androidx.compose.foundation.layout.Box
           import androidx.compose.foundation.layout.Column
@@ -2188,11 +2880,19 @@ jobs:
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
           import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+          import androidx.compose.material.icons.filled.PlayArrow
+          import androidx.camera.video.VideoRecordEvent
           import androidx.compose.material.icons.outlined.AutoMode
+          import androidx.compose.material.icons.outlined.Cameraswitch
+          import androidx.compose.material.icons.outlined.FlashAuto
           import androidx.compose.material.icons.outlined.FlashOff
           import androidx.compose.material.icons.outlined.FlashOn
+          import androidx.compose.material.icons.outlined.FlashlightOff
+          import androidx.compose.material.icons.outlined.FlashlightOn
+          import androidx.compose.material.icons.outlined.FolderOpen
+          import androidx.compose.material.icons.outlined.HighQuality
           import androidx.compose.material.icons.outlined.PhotoLibrary
+          import androidx.compose.material.icons.outlined.Settings
           import androidx.compose.material3.Badge
           import androidx.compose.material3.BadgedBox
           import androidx.compose.material3.Button
@@ -2207,10 +2907,13 @@ jobs:
           import androidx.compose.runtime.DisposableEffect
           import androidx.compose.runtime.LaunchedEffect
           import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
           import androidx.compose.runtime.remember
           import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
           import androidx.compose.ui.geometry.Offset
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.Path
@@ -2218,42 +2921,66 @@ jobs:
           import androidx.compose.ui.graphics.StrokeJoin
           import androidx.compose.ui.graphics.drawscope.Fill
           import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.platform.LocalLifecycleOwner
+          import androidx.compose.ui.res.pluralStringResource
           import androidx.compose.ui.res.stringResource
+          import androidx.compose.ui.semantics.LiveRegionMode
           import androidx.compose.ui.semantics.Role
           import androidx.compose.ui.semantics.contentDescription
           import androidx.compose.ui.semantics.liveRegion
-          import androidx.compose.ui.semantics.LiveRegionMode
+          import androidx.compose.ui.semantics.selected
           import androidx.compose.ui.semantics.semantics
+          import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.viewinterop.AndroidView
           import androidx.hilt.navigation.compose.hiltViewModel
           import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import coil.compose.AsyncImage
           import com.docscan.pro.R
           import com.docscan.pro.core.camera.CameraController
+          import com.docscan.pro.core.camera.FaceAnalyzer
           import com.docscan.pro.core.camera.FrameAnalyzer
+          import com.docscan.pro.core.utils.ShareUtils
           import com.docscan.pro.data.model.AppResult
+          import com.docscan.pro.data.model.CameraMode
+          import com.docscan.pro.data.model.FlashSetting
           import com.docscan.pro.data.model.Pt
+          import com.docscan.pro.data.model.Quad
           import com.docscan.pro.di.CameraEntryPoint
+          import com.docscan.pro.presentation.components.labelRes
           import com.docscan.pro.presentation.theme.ScanGreen
           import com.google.accompanist.permissions.ExperimentalPermissionsApi
           import com.google.accompanist.permissions.isGranted
           import com.google.accompanist.permissions.rememberPermissionState
           import com.google.accompanist.permissions.shouldShowRationale
           import dagger.hilt.android.EntryPointAccessors
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
           import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
           import java.io.File
+          import kotlin.math.abs
           import kotlin.math.max
 
-          /** Écran caméra avec gestion de la permission. */
+          /** Jaune du mode sélectionné. */
+          private val ModeYellow = Color(0xFFFFC928)
+
+          /** Écran principal : appareil photo (modes Photo et Documents). */
           @OptIn(ExperimentalPermissionsApi::class)
           @Composable
-          fun CameraScreen(onCaptured: () -> Unit, onBack: () -> Unit, vm: CameraViewModel = hiltViewModel()) {
+          fun CameraScreen(
+              onOpenEditor: () -> Unit,
+              onLibrary: () -> Unit,
+              onSettings: () -> Unit,
+              vm: CameraViewModel = hiltViewModel()
+          ) {
               val permission = rememberPermissionState(Manifest.permission.CAMERA)
               LaunchedEffect(Unit) { if (!permission.status.isGranted) permission.launchPermissionRequest() }
               if (permission.status.isGranted) {
-                  CameraContent(vm, onCaptured, onBack)
+                  CameraContent(vm, onOpenEditor, onLibrary, onSettings)
               } else {
                   Column(
                       Modifier.fillMaxSize().padding(24.dp),
@@ -2271,128 +2998,531 @@ jobs:
                       )
                       Spacer(Modifier.height(16.dp))
                       Button(onClick = { permission.launchPermissionRequest() }) { Text(stringResource(R.string.action_allow)) }
+                      Spacer(Modifier.height(8.dp))
+                      Button(onClick = onLibrary) { Text(stringResource(R.string.library_title)) }
                   }
               }
           }
 
+          @OptIn(ExperimentalPermissionsApi::class)
+          @SuppressLint("ClickableViewAccessibility")
           @Composable
-          private fun CameraContent(vm: CameraViewModel, onCaptured: () -> Unit, onBack: () -> Unit) {
+          private fun CameraContent(
+              vm: CameraViewModel,
+              onOpenEditor: () -> Unit,
+              onLibrary: () -> Unit,
+              onSettings: () -> Unit
+          ) {
               val context = LocalContext.current
               val lifecycleOwner = LocalLifecycleOwner.current
               val state by vm.state.collectAsStateWithLifecycle()
               val scope = rememberCoroutineScope()
               val snackbar = remember { SnackbarHostState() }
               val controller = remember { CameraController(context.applicationContext) }
+              val entry = remember {
+                  EntryPointAccessors.fromApplication(context.applicationContext, CameraEntryPoint::class.java)
+              }
+              val detector = remember { entry.documentDetector() }
+              val gallery = remember { entry.galleryStore() }
+              var focusPoint by remember { mutableStateOf<Offset?>(null) }
+              var flashFrame by remember { mutableStateOf(false) }
               val previewView = remember {
                   PreviewView(context).apply {
                       scaleType = PreviewView.ScaleType.FILL_CENTER
                       implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                   }
               }
-              val detector = remember {
-                  EntryPointAccessors.fromApplication(context.applicationContext, CameraEntryPoint::class.java).documentDetector()
+              val faceAnalyzer = remember { FaceAnalyzer { vm.onFaces(it) } }
+              DisposableEffect(Unit) { onDispose { faceAnalyzer.close() } }
+              val analyzer = remember {
+                  FrameAnalyzer(
+                      detector,
+                      enabled = { vm.analysisEnabled() },
+                      faceAnalyzer = faceAnalyzer,
+                      faceEnabled = { vm.faceAnalysisEnabled() }
+                  ) { vm.onFrame(it) }
               }
               val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
                   if (uri != null) vm.onImport(uri.toString())
               }
+              // Appareil photo du téléphone (traitement MIUI), puis recadrage automatique.
+              var systemPath by remember { mutableStateOf<String?>(null) }
+              val systemCamera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+                  systemPath?.let { vm.onSystemCaptureResult(it, ok) }
+                  systemPath = null
+              }
+              fun launchSystemCamera() {
+                  val path = vm.startSystemCapture() ?: return
+                  systemPath = path
+                  try {
+                      systemCamera.launch(gallery.uriForFile(File(path)))
+                  } catch (e: Exception) {
+                      vm.onSystemCaptureResult(path, false)
+                      systemPath = null
+                      scope.launch { snackbar.showSnackbar(context.getString(R.string.error_no_camera_app)) }
+                  }
+              }
 
-              DisposableEffect(lifecycleOwner) {
-                  controller.bind(lifecycleOwner, previewView, FrameAnalyzer(detector) { vm.onFrame(it) }) { t ->
+              /** Projection d'un point normalisé de l'image analysée vers les pixels de l'aperçu (FILL_CENTER). */
+              fun toPreview(nx: Float, ny: Float, fw: Int, fh: Int): Offset {
+                  val vw = previewView.width.toFloat().coerceAtLeast(1f)
+                  val vh = previewView.height.toFloat().coerceAtLeast(1f)
+                  val scale = max(vw / fw, vh / fh)
+                  return Offset(nx * fw * scale + (vw - fw * scale) / 2f, ny * fh * scale + (vh - fh * scale) / 2f)
+              }
+
+              // Mise au point automatique sur le plus grand visage (au plus toutes les 1,5 s ou s'il bouge).
+              var lastFaceFocus by remember { mutableStateOf(0L) }
+              var lastFaceCenter by remember { mutableStateOf(Offset.Zero) }
+              LaunchedEffect(state.faces) {
+                  val main = state.faces.maxByOrNull { it.area } ?: return@LaunchedEffect
+                  val nx = if (state.front) 1f - main.centerX else main.centerX
+                  val c = Offset(nx, main.centerY)
+                  val now = System.currentTimeMillis()
+                  if (now - lastFaceFocus > 1500 || (c - lastFaceCenter).getDistance() > 0.15f) {
+                      lastFaceFocus = now
+                      lastFaceCenter = c
+                      val p = toPreview(c.x, c.y, state.faceFrameWidth, state.faceFrameHeight)
+                      controller.focusAt(previewView, p.x, p.y)
+                  }
+              }
+
+              // Gestes sur l'aperçu : pincer = zoom, toucher = mise au point, glisser = changer de mode.
+              DisposableEffect(previewView) {
+                  val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      override fun onScale(detector: ScaleGestureDetector): Boolean {
+                          controller.scaleZoom(detector.scaleFactor)
+                          return true
+                      }
+                  })
+                  val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+                      override fun onDown(e: MotionEvent): Boolean = true
+
+                      override fun onSingleTapUp(e: MotionEvent): Boolean {
+                          controller.focusAt(previewView, e.x, e.y)
+                          focusPoint = Offset(e.x, e.y)
+                          return true
+                      }
+
+                      override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                          if (e1 == null) return false
+                          val dx = e2.x - e1.x
+                          val dy = e2.y - e1.y
+                          if (abs(dx) > 120 && abs(dx) > abs(dy) * 1.5f) {
+                              vm.swipeMode(if (dx < 0) 1 else -1)
+                              return true
+                          }
+                          return false
+                      }
+                  })
+                  previewView.setOnTouchListener { _, ev ->
+                      scaleDetector.onTouchEvent(ev)
+                      if (!scaleDetector.isInProgress) gestureDetector.onTouchEvent(ev)
+                      true
+                  }
+                  onDispose { previewView.setOnTouchListener(null) }
+              }
+
+              val isVideoMode = state.mode == CameraMode.VIDEO
+              LaunchedEffect(state.front, isVideoMode, state.videoQuality) {
+                  controller.bind(lifecycleOwner, previewView, analyzer, state.front, isVideoMode, state.videoQuality) { t ->
                       scope.launch { snackbar.showSnackbar(t.message ?: "Camera error") }
                   }
-                  onDispose { controller.release() }
               }
-              LaunchedEffect(state.torchOn) { controller.setTorch(state.torchOn) }
+              // Micro : demandé une fois à l'entrée en mode Vidéo (sans micro, vidéo muette).
+              val micPermission = rememberPermissionState(Manifest.permission.RECORD_AUDIO)
+              var micAsked by remember { mutableStateOf(false) }
+              LaunchedEffect(isVideoMode) {
+                  if (isVideoMode && !micPermission.status.isGranted && !micAsked) {
+                      micAsked = true
+                      micPermission.launchPermissionRequest()
+                  }
+              }
+              DisposableEffect(Unit) { onDispose { controller.release() } }
+              LaunchedEffect(state.torchOn, state.mode) { controller.setTorch(state.torchOn && state.mode != CameraMode.PHOTO) }
+              LaunchedEffect(state.flash) { controller.setFlash(state.flash) }
+              LaunchedEffect(focusPoint) { if (focusPoint != null) { delay(900); focusPoint = null } }
+              LaunchedEffect(flashFrame) { if (flashFrame) { delay(110); flashFrame = false } }
               LaunchedEffect(Unit) {
                   vm.events.collect { e ->
                       when (e) {
-                          is CameraEvent.Capture -> when (val r = controller.capture(File(e.path))) {
-                              is AppResult.Success -> vm.onPhotoSaved(e.path)
-                              is AppResult.Error -> vm.onCaptureFailed(r.message)
+                          is CameraEvent.Capture -> {
+                              if (e.focusFirst) {
+                                  // Mise au point sur le centre du document (ou de l'écran) avant la photo.
+                                  val q = vm.state.value.quad
+                                  val st = vm.state.value
+                                  val p = if (q != null) {
+                                      toPreview(q.points.map { it.x }.average().toFloat(), q.points.map { it.y }.average().toFloat(), st.frameWidth, st.frameHeight)
+                                  } else {
+                                      Offset(previewView.width / 2f, previewView.height / 2f)
+                                  }
+                                  controller.focusAndWait(previewView, p.x, p.y)
+                              }
+                              flashFrame = true
+                              when (val r = controller.capture(File(e.path))) {
+                                  is AppResult.Success -> vm.onDocumentSaved(e.path)
+                                  is AppResult.Error -> vm.onCaptureFailed(r.message)
+                              }
                           }
-                          CameraEvent.OpenEditor -> onCaptured()
+                          CameraEvent.TakePhoto -> {
+                              flashFrame = true
+                              val s = vm.state.value
+                              val target = withContext(Dispatchers.IO) { gallery.photoOutput(s.photoDest, s.photoTreeUri) }
+                              when (val r = controller.captureTo(target.options)) {
+                                  is AppResult.Success -> {
+                                      val uri = withContext(Dispatchers.IO) { gallery.finish(target, true, r.data) }
+                                      vm.onPhotoSaved(uri?.toString())
+                                  }
+                                  is AppResult.Error -> {
+                                      withContext(Dispatchers.IO) { gallery.finish(target, false, null) }
+                                      vm.onPhotoFailed(r.message)
+                                  }
+                              }
+                          }
+                          CameraEvent.StartVideo -> {
+                              val s = vm.state.value
+                              val target = withContext(Dispatchers.IO) { gallery.videoOutput(s.photoDest, s.photoTreeUri) }
+                              val started = controller.startRecording(target, micPermission.status.isGranted) { ev ->
+                                  when (ev) {
+                                      is VideoRecordEvent.Start -> vm.onRecordingStarted()
+                                      is VideoRecordEvent.Status -> vm.onRecordingStatus(
+                                          ev.recordingStats.recordedDurationNanos / 1_000_000_000L,
+                                          ev.recordingStats.numBytesRecorded
+                                      )
+                                      is VideoRecordEvent.Finalize -> {
+                                          val ok = !ev.hasError() || ev.error in setOf(
+                                              VideoRecordEvent.Finalize.ERROR_FILE_SIZE_LIMIT_REACHED,
+                                              VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE
+                                          )
+                                          val uri = gallery.finishVideo(target, ok, ev.outputResults.outputUri)
+                                          if (ok) vm.onVideoSaved(uri?.toString())
+                                          else vm.onVideoFailed(ev.cause?.message ?: context.getString(R.string.error_video))
+                                      }
+                                      else -> Unit
+                                  }
+                              }
+                              if (!started) {
+                                  gallery.finishVideo(target, false, null)
+                                  vm.onVideoFailed(context.getString(R.string.error_video))
+                              }
+                          }
+                          CameraEvent.StopVideo -> controller.stopRecording()
+                          CameraEvent.OpenEditor -> onOpenEditor()
                           is CameraEvent.Error -> snackbar.showSnackbar(e.message)
                       }
                   }
               }
 
+              val isDoc = state.mode == CameraMode.DOCUMENT
+              val busyRecording = state.recording || state.videoBusy
+
               Box(Modifier.fillMaxSize().background(Color.Black)) {
                   AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
-                  DetectionOverlay(state)
+                  if (isDoc) DetectionOverlay(state)
+                  if (state.mode == CameraMode.PHOTO && state.faceDetection) FaceOverlay(state)
+                  FocusRing(focusPoint)
+                  if (flashFrame) Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f)))
 
                   // Barre supérieure
                   Row(
-                      Modifier.fillMaxWidth().statusBarsPadding().padding(8.dp),
+                      Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 8.dp, vertical = 6.dp),
                       verticalAlignment = Alignment.CenterVertically
                   ) {
-                      RoundIcon(onClick = onBack) {
-                          Icon(Icons.AutoMirrored.Outlined.ArrowBack, stringResource(R.string.action_back), tint = Color.White)
+                      RoundIcon(onClick = { if (!busyRecording) onLibrary() }) {
+                          Icon(Icons.Outlined.FolderOpen, stringResource(R.string.library_title), tint = Color.White)
                       }
                       Spacer(Modifier.weight(1f))
-                      RoundIcon(onClick = vm::toggleAuto) {
-                          Icon(
-                              Icons.Outlined.AutoMode,
-                              stringResource(if (state.autoCapture) R.string.auto_on else R.string.auto_off),
-                              tint = if (state.autoCapture) ScanGreen else Color.White
-                          )
+                      if (isDoc) {
+                          RoundIcon(onClick = { launchSystemCamera() }) {
+                              Icon(Icons.Outlined.HighQuality, stringResource(R.string.action_system_camera), tint = Color.White)
+                          }
+                          Spacer(Modifier.size(8.dp))
+                          RoundIcon(onClick = vm::toggleAuto) {
+                              Icon(
+                                  Icons.Outlined.AutoMode,
+                                  stringResource(if (state.autoCapture) R.string.auto_on else R.string.auto_off),
+                                  tint = if (state.autoCapture) ScanGreen else Color.White
+                              )
+                          }
+                          Spacer(Modifier.size(8.dp))
+                      }
+                      RoundIcon(onClick = vm::onFlashClick) {
+                          val (icon, label) = if (state.mode != CameraMode.PHOTO) {
+                              if (state.torchOn) Icons.Outlined.FlashlightOn to R.string.torch_on
+                              else Icons.Outlined.FlashlightOff to R.string.torch_off
+                          } else when (state.flash) {
+                              FlashSetting.OFF -> Icons.Outlined.FlashOff to R.string.flash_off
+                              FlashSetting.AUTO -> Icons.Outlined.FlashAuto to R.string.flash_auto
+                              FlashSetting.ON -> Icons.Outlined.FlashOn to R.string.flash_on
+                          }
+                          Icon(icon, stringResource(label), tint = if (state.mode != CameraMode.PHOTO && state.torchOn) ModeYellow else Color.White)
                       }
                       Spacer(Modifier.size(8.dp))
-                      RoundIcon(onClick = vm::toggleTorch) {
-                          Icon(
-                              if (state.torchOn) Icons.Outlined.FlashOn else Icons.Outlined.FlashOff,
-                              stringResource(R.string.action_torch), tint = Color.White
+                      RoundIcon(onClick = { if (!busyRecording) onSettings() }) {
+                          Icon(Icons.Outlined.Settings, stringResource(R.string.settings_title), tint = Color.White)
+                      }
+                  }
+
+                  // Nombre de visages (mode Photo)
+                  if (state.mode == CameraMode.PHOTO && state.faces.isNotEmpty()) {
+                      Text(
+                          pluralStringResource(R.plurals.faces_detected, state.faces.size, state.faces.size),
+                          color = Color.Black,
+                          style = MaterialTheme.typography.labelLarge,
+                          modifier = Modifier
+                              .align(Alignment.TopCenter)
+                              .statusBarsPadding()
+                              .padding(top = 68.dp)
+                              .background(ModeYellow, RoundedCornerShape(50))
+                              .padding(horizontal = 14.dp, vertical = 6.dp)
+                              .semantics { liveRegion = LiveRegionMode.Polite }
+                      )
+                  }
+
+                  // Aide (mode Documents)
+                  if (isDoc) {
+                      val hint = when {
+                          state.processing -> R.string.hint_processing
+                          !state.detected -> R.string.hint_searching
+                          !state.sharp -> R.string.hint_blurry
+                          !state.stable -> R.string.hint_hold_still
+                          state.autoCapture -> R.string.hint_capturing
+                          else -> R.string.hint_ready
+                      }
+                      Text(
+                          stringResource(hint),
+                          color = Color.White,
+                          style = MaterialTheme.typography.labelLarge,
+                          modifier = Modifier
+                              .align(Alignment.TopCenter)
+                              .statusBarsPadding()
+                              .padding(top = 68.dp)
+                              .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(50))
+                              .padding(horizontal = 16.dp, vertical = 8.dp)
+                              .semantics { liveRegion = LiveRegionMode.Polite }
+                      )
+                  }
+
+                  // Durée et taille pendant l'enregistrement
+                  if (isVideoMode && state.recording) {
+                      val mm = state.recordSeconds / 60
+                      val ss = state.recordSeconds % 60
+                      val mb = state.recordBytes / 1_048_576.0
+                      Row(
+                          Modifier
+                              .align(Alignment.TopCenter)
+                              .statusBarsPadding()
+                              .padding(top = 68.dp)
+                              .background(Color(0xCCD32F2F), RoundedCornerShape(50))
+                              .padding(horizontal = 14.dp, vertical = 6.dp)
+                              .semantics { liveRegion = LiveRegionMode.Polite },
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Box(Modifier.size(10.dp).background(Color.White, CircleShape))
+                          Spacer(Modifier.size(8.dp))
+                          Text(
+                              String.format(java.util.Locale.US, "%02d:%02d  ·  %.1f Mo", mm, ss, mb),
+                              color = Color.White,
+                              style = MaterialTheme.typography.labelLarge
                           )
                       }
                   }
 
-                  // Message d'aide
-                  val hint = when {
-                      state.processing -> R.string.hint_processing
-                      !state.detected -> R.string.hint_searching
-                      !state.sharp -> R.string.hint_blurry
-                      !state.stable -> R.string.hint_hold_still
-                      state.autoCapture -> R.string.hint_capturing
-                      else -> R.string.hint_ready
-                  }
-                  Text(
-                      stringResource(hint),
-                      color = Color.White,
-                      style = MaterialTheme.typography.labelLarge,
-                      modifier = Modifier
-                          .align(Alignment.TopCenter)
-                          .statusBarsPadding()
-                          .padding(top = 72.dp)
-                          .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(50))
-                          .padding(horizontal = 16.dp, vertical = 8.dp)
-                          .semantics { liveRegion = LiveRegionMode.Polite }
-                  )
-
-                  // Barre inférieure
-                  Row(
+                  // Partie basse : modes + déclencheur
+                  Column(
                       Modifier
                           .align(Alignment.BottomCenter)
                           .fillMaxWidth()
-                          .background(Color.Black.copy(alpha = 0.45f))
+                          .background(Color.Black.copy(alpha = 0.55f))
                           .navigationBarsPadding()
-                          .padding(vertical = 20.dp, horizontal = 24.dp),
-                      verticalAlignment = Alignment.CenterVertically,
-                      horizontalArrangement = Arrangement.SpaceBetween
+                          .pointerInput(Unit) {
+                              var total = 0f
+                              detectHorizontalDragGestures(
+                                  onDragStart = { total = 0f },
+                                  onDragEnd = {
+                                      if (abs(total) > 80f) vm.swipeMode(if (total < 0) 1 else -1)
+                                      total = 0f
+                                  },
+                                  onHorizontalDrag = { change, amount -> change.consume(); total += amount }
+                              )
+                          }
+                          .padding(bottom = 18.dp)
                   ) {
-                      IconButton(onClick = {
-                          picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                      }) {
-                          Icon(Icons.Outlined.PhotoLibrary, stringResource(R.string.action_import), tint = Color.White)
+                      Row(
+                          Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 14.dp),
+                          horizontalArrangement = Arrangement.Center
+                      ) {
+                          CameraMode.values().forEach { m ->
+                              val isSel = m == state.mode
+                              Text(
+                                  stringResource(m.labelRes()),
+                                  color = if (isSel) ModeYellow else Color.White,
+                                  style = MaterialTheme.typography.titleMedium,
+                                  fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
+                                  modifier = Modifier
+                                      .clip(RoundedCornerShape(50))
+                                      .clickable(role = Role.Tab) { vm.setMode(m) }
+                                      .padding(horizontal = 20.dp, vertical = 8.dp)
+                                      .semantics { selected = isSel }
+                              )
+                          }
                       }
-                      ShutterButton(progress = state.progress, busy = state.processing, onClick = vm::requestCapture)
-                      BadgedBox(badge = { if (state.pageCount > 0) Badge { Text("${state.pageCount}") } }) {
+                      Row(
+                          Modifier.fillMaxWidth().padding(horizontal = 32.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                          horizontalArrangement = Arrangement.SpaceBetween
+                      ) {
+                          // Gauche : vignette
+                          if (isDoc) {
+                              PagesThumb(state.lastPageThumb, state.pageCount, onOpenEditor)
+                          } else {
+                              PhotoThumb(state.lastPhoto, state.lastIsVideo) { uri ->
+                                  ShareUtils.viewMedia(context, Uri.parse(uri), if (state.lastIsVideo) "video/*" else "image/*")
+                              }
+                          }
+                          // Centre : déclencheur
+                          if (isVideoMode) {
+                              VideoShutter(recording = state.recording, busy = state.videoBusy, onClick = vm::onShutter)
+                          } else {
+                              ShutterButton(
+                                  progress = if (isDoc) state.progress else 0f,
+                                  busy = if (isDoc) state.processing else state.photoBusy,
+                                  onClick = vm::onShutter
+                              )
+                          }
+                          // Droite : import (Documents) ou caméra avant/arrière (Photo)
                           Box(
-                              Modifier.size(44.dp).border(2.dp, Color.White, RoundedCornerShape(8.dp))
-                                  .clickable(enabled = state.pageCount > 0, role = Role.Button, onClick = onCaptured)
-                                  .semantics { contentDescription = "${state.pageCount}" }
+                              Modifier.size(56.dp).background(Color.White.copy(alpha = 0.15f), CircleShape),
+                              contentAlignment = Alignment.Center
+                          ) {
+                              if (isDoc) {
+                                  IconButton(onClick = {
+                                      picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                  }) {
+                                      Icon(Icons.Outlined.PhotoLibrary, stringResource(R.string.action_import), tint = Color.White)
+                                  }
+                              } else {
+                                  IconButton(onClick = vm::switchLens, enabled = !busyRecording) {
+                                      Icon(Icons.Outlined.Cameraswitch, stringResource(R.string.action_switch_camera), tint = Color.White)
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(bottom = 190.dp))
+              }
+          }
+
+          /** Vignette ronde de la dernière photo (mode Photo). */
+          @Composable
+          private fun PhotoThumb(uri: String?, isVideo: Boolean, onOpen: (String) -> Unit) {
+              val label = stringResource(R.string.action_view_photo)
+              Box(
+                  Modifier
+                      .size(56.dp)
+                      .clip(CircleShape)
+                      .background(Color.White.copy(alpha = 0.15f))
+                      .border(2.dp, Color.White, CircleShape)
+                      .clickable(enabled = uri != null, role = Role.Button) { uri?.let(onOpen) }
+                      .semantics { contentDescription = label }
+              ) {
+                  if (uri != null) {
+                      AsyncImage(model = Uri.parse(uri), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                      if (isVideo) {
+                          Icon(
+                              Icons.Filled.PlayArrow, contentDescription = null, tint = Color.White,
+                              modifier = Modifier.align(Alignment.Center).size(24.dp)
                           )
                       }
                   }
-                  SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).padding(bottom = 140.dp))
+              }
+          }
+
+          /** Déclencheur vidéo : rond rouge, carré rouge pendant l'enregistrement. */
+          @Composable
+          private fun VideoShutter(recording: Boolean, busy: Boolean, onClick: () -> Unit) {
+              val label = stringResource(if (recording) R.string.action_stop_video else R.string.action_start_video)
+              val inner by animateFloatAsState(if (recording) 0.45f else 0.82f, tween(200), label = "rec")
+              Box(
+                  Modifier
+                      .size(80.dp)
+                      .border(5.dp, Color.White, CircleShape)
+                      .clip(CircleShape)
+                      .clickable(enabled = !busy, role = Role.Button, onClick = onClick)
+                      .semantics { contentDescription = label },
+                  contentAlignment = Alignment.Center
+              ) {
+                  Box(
+                      Modifier
+                          .size(80.dp * inner)
+                          .background(Color(0xFFE53935), if (recording) RoundedCornerShape(8.dp) else CircleShape)
+                  )
+                  if (busy) CircularProgressIndicator(Modifier.size(34.dp), color = Color.White, strokeWidth = 3.dp)
+              }
+          }
+
+          /** Vignette des pages scannées (mode Documents). */
+          @Composable
+          private fun PagesThumb(path: String?, count: Int, onOpen: () -> Unit) {
+              val label = stringResource(R.string.action_open_pages, count)
+              BadgedBox(badge = { if (count > 0) Badge { Text("$count") } }) {
+                  Box(
+                      Modifier
+                          .size(48.dp, 56.dp)
+                          .clip(RoundedCornerShape(8.dp))
+                          .background(Color.White.copy(alpha = 0.15f))
+                          .border(2.dp, Color.White, RoundedCornerShape(8.dp))
+                          .clickable(enabled = count > 0, role = Role.Button, onClick = onOpen)
+                          .semantics { contentDescription = label }
+                  ) {
+                      if (path != null && File(path).exists()) {
+                          AsyncImage(model = File(path), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                      }
+                  }
+              }
+          }
+
+          /** Cadres jaunes autour des visages détectés (aperçu miroir pour la caméra avant). */
+          @Composable
+          private fun FaceOverlay(state: CameraUiState) {
+              val faces = state.faces
+              if (faces.isEmpty()) return
+              Canvas(Modifier.fillMaxSize()) {
+                  val fw = state.faceFrameWidth.toFloat()
+                  val fh = state.faceFrameHeight.toFloat()
+                  val scale = max(size.width / fw, size.height / fh)
+                  val dx = (size.width - fw * scale) / 2f
+                  val dy = (size.height - fh * scale) / 2f
+                  val stroke = Stroke(3.dp.toPx(), cap = StrokeCap.Round)
+                  faces.forEach { f ->
+                      val l0 = if (state.front) 1f - f.right else f.left
+                      val r0 = if (state.front) 1f - f.left else f.right
+                      val left = l0 * fw * scale + dx
+                      val right = r0 * fw * scale + dx
+                      val top = f.top * fh * scale + dy
+                      val bottom = f.bottom * fh * scale + dy
+                      val c = minOf(right - left, bottom - top) * 0.25f
+                      val path = Path().apply {
+                          moveTo(left, top + c); lineTo(left, top); lineTo(left + c, top)
+                          moveTo(right - c, top); lineTo(right, top); lineTo(right, top + c)
+                          moveTo(right, bottom - c); lineTo(right, bottom); lineTo(right - c, bottom)
+                          moveTo(left + c, bottom); lineTo(left, bottom); lineTo(left, bottom - c)
+                      }
+                      drawPath(path, ModeYellow, style = stroke)
+                  }
+              }
+          }
+
+          /** Cercle de mise au point. */
+          @Composable
+          private fun FocusRing(point: Offset?) {
+              val alpha by animateFloatAsState(if (point != null) 1f else 0f, tween(200), label = "focus")
+              var last by remember { mutableStateOf(Offset.Zero) }
+              LaunchedEffect(point) { if (point != null) last = point }
+              Canvas(Modifier.fillMaxSize()) {
+                  if (alpha > 0.01f) {
+                      drawCircle(ModeYellow.copy(alpha = alpha), 36.dp.toPx(), last, style = Stroke(2.dp.toPx()))
+                  }
               }
           }
 
@@ -2401,7 +3531,7 @@ jobs:
           private fun DetectionOverlay(state: CameraUiState) {
               val q = state.quad
               val alpha by animateFloatAsState(if (q != null) 1f else 0f, tween(180), label = "alpha")
-              val pts = (q ?: com.docscan.pro.data.model.Quad.FULL_INSET).points
+              val pts = (q ?: Quad.FULL_INSET).points
               val animated = pts.mapIndexed { i, p -> animatedPt(p, i) }
               Canvas(Modifier.fillMaxSize()) {
                   if (alpha <= 0.01f) return@Canvas
@@ -2437,16 +3567,16 @@ jobs:
               val label = stringResource(R.string.action_capture)
               Box(
                   Modifier
-                      .size(78.dp)
-                      .border(4.dp, Color.White, CircleShape)
-                      .padding(7.dp)
+                      .size(80.dp)
+                      .border(5.dp, Color(0xFF3A3A3A), CircleShape)
+                      .padding(8.dp)
                       .background(Color.White, CircleShape)
                       .clickable(enabled = !busy, role = Role.Button, onClick = onClick)
                       .semantics { contentDescription = label },
                   contentAlignment = Alignment.Center
               ) {
                   if (busy) {
-                      CircularProgressIndicator(Modifier.size(36.dp), color = Color.Black, strokeWidth = 3.dp)
+                      CircularProgressIndicator(Modifier.size(34.dp), color = Color.Black, strokeWidth = 3.dp)
                   } else if (progress > 0f) {
                       CircularProgressIndicator(
                           progress = { progress }, modifier = Modifier.size(64.dp), color = ScanGreen, strokeWidth = 5.dp
@@ -2457,20 +3587,26 @@ jobs:
 
           @Composable
           private fun RoundIcon(onClick: () -> Unit, content: @Composable () -> Unit) {
-              Box(Modifier.size(48.dp).background(Color.Black.copy(alpha = 0.45f), CircleShape), contentAlignment = Alignment.Center) {
+              Box(Modifier.size(46.dp).background(Color.Black.copy(alpha = 0.45f), CircleShape), contentAlignment = Alignment.Center) {
                   IconButton(onClick = onClick) { content() }
               }
           }
-          DSP_EOF_26
+          DSP_EOF_28
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/camera'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/camera/CameraViewModel.kt' << 'DSP_EOF_27'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/camera/CameraViewModel.kt' << 'DSP_EOF_29'
           package com.docscan.pro.presentation.camera
 
           import androidx.lifecycle.ViewModel
           import androidx.lifecycle.viewModelScope
           import com.docscan.pro.core.utils.FileStore
           import com.docscan.pro.data.model.AppResult
+          import com.docscan.pro.data.model.CameraMode
+          import com.docscan.pro.data.model.FaceBox
+          import com.docscan.pro.data.model.FaceResult
+          import com.docscan.pro.data.model.FlashSetting
           import com.docscan.pro.data.model.FrameResult
+          import com.docscan.pro.data.model.PhotoDestination
+          import com.docscan.pro.data.model.VideoQuality
           import com.docscan.pro.data.model.Pt
           import com.docscan.pro.data.model.Quad
           import com.docscan.pro.data.repository.ScanSession
@@ -2489,6 +3625,7 @@ jobs:
 
           /** État de l'écran caméra. */
           data class CameraUiState(
+              val mode: CameraMode = CameraMode.DOCUMENT,
               val quad: Quad? = null,
               val frameWidth: Int = 480,
               val frameHeight: Int = 640,
@@ -2498,19 +3635,41 @@ jobs:
               val progress: Float = 0f,
               val autoCapture: Boolean = true,
               val torchOn: Boolean = false,
+              val flash: FlashSetting = FlashSetting.OFF,
+              val front: Boolean = false,
               val processing: Boolean = false,
-              val pageCount: Int = 0
+              val photoBusy: Boolean = false,
+              val pageCount: Int = 0,
+              val lastPageThumb: String? = null,
+              val lastPhoto: String? = null,
+              val photoDest: PhotoDestination = PhotoDestination.PICTURES,
+              val photoTreeUri: String? = null,
+              val lastIsVideo: Boolean = false,
+              val videoQuality: VideoQuality = VideoQuality.BALANCED,
+              val recording: Boolean = false,
+              val recordSeconds: Long = 0,
+              val recordBytes: Long = 0,
+              val videoBusy: Boolean = false,
+              val faceDetection: Boolean = true,
+              val faces: List<FaceBox> = emptyList(),
+              val faceFrameWidth: Int = 480,
+              val faceFrameHeight: Int = 640
           )
 
           /** Événements ponctuels de la caméra. */
           sealed interface CameraEvent {
-              /** Déclencher une capture vers [path]. */
-              data class Capture(val path: String) : CameraEvent
+              /** Mode Documents : capturer vers [path] puis recadrer. */
+              data class Capture(val path: String, val focusFirst: Boolean) : CameraEvent
+              /** Mode Photo : prendre une photo vers la galerie. */
+              data object TakePhoto : CameraEvent
+              /** Mode Vidéo : démarrer / arrêter l'enregistrement. */
+              data object StartVideo : CameraEvent
+              data object StopVideo : CameraEvent
               data object OpenEditor : CameraEvent
               data class Error(val message: String) : CameraEvent
           }
 
-          /** ViewModel caméra : lissage du cadre, auto-capture, traitement de la photo. */
+          /** ViewModel caméra : modes Photo / Documents, lissage du cadre, auto-capture, recadrage. */
           @HiltViewModel
           class CameraViewModel @Inject constructor(
               private val autoCapture: AutoCaptureUseCase,
@@ -2531,15 +3690,76 @@ jobs:
 
               init {
                   viewModelScope.launch {
-                      settings.settings.collect { s -> _state.update { it.copy(autoCapture = s.autoCapture) } }
+                      val mode = settings.current().lastMode
+                      _state.update { it.copy(mode = mode) }
                   }
                   viewModelScope.launch {
-                      session.pages.collect { p -> _state.update { it.copy(pageCount = p.size) } }
+                      settings.settings.collect { s ->
+                          _state.update {
+                              it.copy(
+                                  autoCapture = s.autoCapture,
+                                  photoDest = s.photoDest,
+                                  photoTreeUri = s.photoTreeUri,
+                                  lastPhoto = it.lastPhoto ?: s.lastPhotoUri,
+                                  lastIsVideo = if (it.lastPhoto == null) s.lastMediaIsVideo else it.lastIsVideo,
+                                  videoQuality = s.videoQuality,
+                                  faceDetection = s.faceDetection,
+                                  faces = if (s.faceDetection) it.faces else emptyList()
+                              )
+                          }
+                      }
                   }
+                  viewModelScope.launch {
+                      session.pages.collect { p ->
+                          _state.update { it.copy(pageCount = p.size, lastPageThumb = p.lastOrNull()?.processedPath) }
+                      }
+                  }
+              }
+
+              /** L'analyse d'image ne tourne qu'en mode Documents. */
+              fun analysisEnabled(): Boolean {
+                  val s = _state.value
+                  return s.mode == CameraMode.DOCUMENT && !s.processing
+              }
+
+              /** La détection des visages ne tourne qu'en mode Photo (si activée). */
+              fun faceAnalysisEnabled(): Boolean {
+                  val s = _state.value
+                  return s.mode == CameraMode.PHOTO && s.faceDetection && !s.photoBusy
+              }
+
+              /** Visages détectés (thread ML Kit). */
+              fun onFaces(result: FaceResult) {
+                  if (!faceAnalysisEnabled()) return
+                  _state.update {
+                      it.copy(faces = result.faces, faceFrameWidth = result.frameWidth, faceFrameHeight = result.frameHeight)
+                  }
+              }
+
+              /** Change de mode. */
+              fun setMode(mode: CameraMode) {
+                  if (mode == _state.value.mode || captureInFlight || _state.value.recording || _state.value.videoBusy) return
+                  autoCapture.reset()
+                  lastQuad = null
+                  _state.update {
+                      it.copy(
+                          mode = mode, quad = null, detected = false, stable = false, progress = 0f, faces = emptyList(),
+                          torchOn = false, front = if (mode == CameraMode.DOCUMENT) false else it.front
+                      )
+                  }
+                  viewModelScope.launch { settings.setLastMode(mode) }
+              }
+
+              /** Glissement horizontal : mode suivant (+1) ou précédent (-1). */
+              fun swipeMode(delta: Int) {
+                  val all = CameraMode.values()
+                  val i = (all.indexOf(_state.value.mode) + delta).coerceIn(0, all.size - 1)
+                  setMode(all[i])
               }
 
               /** Appelé depuis le thread d'analyse pour chaque frame. */
               fun onFrame(frame: FrameResult) {
+                  if (_state.value.mode != CameraMode.DOCUMENT) return
                   val auto = autoCapture.onFrame(frame)
                   val raw = frame.detection?.quad.takeIf { auto.detected }
                   val smoothed = raw?.let { q -> lastQuad?.let { smooth(it, q) } ?: q }
@@ -2554,18 +3774,89 @@ jobs:
                   if (auto.shouldCapture && _state.value.autoCapture) requestCapture()
               }
 
-              /** Capture manuelle ou automatique. */
-              fun requestCapture() {
+              /** Bouton déclencheur. */
+              fun onShutter() {
+                  val st = _state.value
+                  if (st.mode == CameraMode.VIDEO) {
+                      when {
+                          st.recording -> viewModelScope.launch { _events.send(CameraEvent.StopVideo) }
+                          !st.videoBusy -> {
+                              _state.update { it.copy(videoBusy = true) }
+                              viewModelScope.launch { _events.send(CameraEvent.StartVideo) }
+                          }
+                      }
+                  } else if (st.mode == CameraMode.DOCUMENT) {
+                      requestCapture(focusFirst = true)
+                  } else if (!st.photoBusy) {
+                      _state.update { it.copy(photoBusy = true) }
+                      viewModelScope.launch { _events.send(CameraEvent.TakePhoto) }
+                  }
+              }
+
+              /** Mode Photo : photo enregistrée dans la galerie. */
+              fun onPhotoSaved(uri: String?) {
+                  _state.update { it.copy(photoBusy = false, lastPhoto = uri ?: it.lastPhoto, lastIsVideo = if (uri != null) false else it.lastIsVideo) }
+                  if (uri != null) viewModelScope.launch { settings.setLastPhoto(uri, isVideo = false) }
+              }
+
+              /** Mode Photo : échec. */
+              fun onPhotoFailed(message: String) {
+                  _state.update { it.copy(photoBusy = false) }
+                  viewModelScope.launch { _events.send(CameraEvent.Error(message)) }
+              }
+
+              /** Mode Vidéo : l'enregistrement a démarré. */
+              fun onRecordingStarted() = _state.update { it.copy(recording = true, videoBusy = false, recordSeconds = 0, recordBytes = 0) }
+
+              /** Mode Vidéo : progression (durée, taille du fichier). */
+              fun onRecordingStatus(seconds: Long, bytes: Long) =
+                  _state.update { it.copy(recordSeconds = seconds, recordBytes = bytes) }
+
+              /** Mode Vidéo : vidéo enregistrée. */
+              fun onVideoSaved(uri: String?) {
+                  _state.update { it.copy(recording = false, videoBusy = false, lastPhoto = uri ?: it.lastPhoto, lastIsVideo = if (uri != null) true else it.lastIsVideo) }
+                  if (uri != null) viewModelScope.launch { settings.setLastPhoto(uri, isVideo = true) }
+              }
+
+              /** Mode Vidéo : échec. */
+              fun onVideoFailed(message: String) {
+                  _state.update { it.copy(recording = false, videoBusy = false) }
+                  viewModelScope.launch { _events.send(CameraEvent.Error(message)) }
+              }
+
+              /** Mode Documents : capture manuelle ou automatique. */
+              fun requestCapture(focusFirst: Boolean = false) {
                   if (captureInFlight) return
                   captureInFlight = true
                   _state.update { it.copy(processing = true) }
                   val path = fileStore.newCaptureFile().absolutePath
-                  viewModelScope.launch { _events.send(CameraEvent.Capture(path)) }
+                  viewModelScope.launch { _events.send(CameraEvent.Capture(path, focusFirst)) }
               }
 
-              /** Photo enregistrée par CameraX. */
-              fun onPhotoSaved(path: String) {
-                  val hint = lastQuad
+              /**
+               * Mode Documents : prise de vue avec l'appareil photo du téléphone (traitement du fabricant).
+               * Renvoie le chemin où la photo doit être écrite, ou null si une capture est déjà en cours.
+               */
+              fun startSystemCapture(): String? {
+                  if (captureInFlight) return null
+                  captureInFlight = true
+                  _state.update { it.copy(processing = true) }
+                  return fileStore.newCaptureFile().absolutePath
+              }
+
+              /** Retour de l'appareil photo du téléphone : recadrage automatique si une photo a été prise. */
+              fun onSystemCaptureResult(path: String, ok: Boolean) {
+                  if (ok && java.io.File(path).length() > 0) {
+                      onDocumentSaved(path, useLiveHint = false)
+                  } else {
+                      fileStore.deleteQuietly(path)
+                      finishCapture()
+                  }
+              }
+
+              /** Mode Documents : photo enregistrée par CameraX, recadrage automatique. */
+              fun onDocumentSaved(path: String, useLiveHint: Boolean = true) {
+                  val hint = if (useLiveHint) lastQuad else null
                   viewModelScope.launch {
                       when (val r = processCapture(path, hint)) {
                           is AppResult.Success -> {
@@ -2581,13 +3872,13 @@ jobs:
                   }
               }
 
-              /** Échec de la prise de vue. */
+              /** Mode Documents : échec de la prise de vue. */
               fun onCaptureFailed(message: String) {
                   viewModelScope.launch { _events.send(CameraEvent.Error(message)) }
                   finishCapture()
               }
 
-              /** Image importée depuis la galerie. */
+              /** Image importée depuis la galerie (recadrée comme un document). */
               fun onImport(uri: String) {
                   if (captureInFlight) return
                   captureInFlight = true
@@ -2601,8 +3892,23 @@ jobs:
                   }
               }
 
-              /** Bascule de la torche. */
-              fun toggleTorch() = _state.update { it.copy(torchOn = !it.torchOn) }
+              /** Bouton flash : torche en Documents, flash Éteint/Auto/Allumé en Photo. */
+              fun onFlashClick() {
+                  if (_state.value.mode != CameraMode.PHOTO) {
+                      _state.update { it.copy(torchOn = !it.torchOn) }
+                  } else {
+                      _state.update {
+                          val next = FlashSetting.values()[(it.flash.ordinal + 1) % FlashSetting.values().size]
+                          it.copy(flash = next)
+                      }
+                  }
+              }
+
+              /** Caméra avant / arrière (modes Photo et Vidéo, hors enregistrement). */
+              fun switchLens() {
+                  val st = _state.value
+                  if (st.mode != CameraMode.DOCUMENT && !st.recording && !st.videoBusy) _state.update { it.copy(front = !it.front) }
+              }
 
               /** Bascule de la capture automatique. */
               fun toggleAuto() {
@@ -2622,9 +3928,9 @@ jobs:
                   return Quad(m(a.tl, b.tl), m(a.tr, b.tr), m(a.br, b.br), m(a.bl, b.bl))
               }
           }
-          DSP_EOF_27
+          DSP_EOF_29
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/components'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/components/DocumentRow.kt' << 'DSP_EOF_28'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/components/DocumentRow.kt' << 'DSP_EOF_30'
           package com.docscan.pro.presentation.components
 
           import androidx.compose.foundation.background
@@ -2702,16 +4008,18 @@ jobs:
                   }
               }
           }
-          DSP_EOF_28
+          DSP_EOF_30
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/components'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/components/Labels.kt' << 'DSP_EOF_29'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/components/Labels.kt' << 'DSP_EOF_31'
           package com.docscan.pro.presentation.components
 
           import androidx.annotation.StringRes
           import com.docscan.pro.R
+          import com.docscan.pro.data.model.CameraMode
           import com.docscan.pro.data.model.DocumentType
           import com.docscan.pro.data.model.PdfQuality
           import com.docscan.pro.data.model.ScanFilter
+          import com.docscan.pro.data.model.VideoQuality
 
           /** Libellé localisé d'un filtre. */
           @StringRes
@@ -2747,9 +4055,26 @@ jobs:
               DocumentType.IMPRIME -> ScanFilter.DOCUMENT
               DocumentType.DESSIN -> ScanFilter.SKETCH
           }
-          DSP_EOF_29
+
+          /** Libellé localisé d'un mode caméra. */
+          @StringRes
+          fun CameraMode.labelRes(): Int = when (this) {
+              CameraMode.DOCUMENT -> R.string.mode_document
+              CameraMode.VIDEO -> R.string.mode_video
+              CameraMode.PHOTO -> R.string.mode_photo
+          }
+
+          /** Libellé localisé d'une qualité vidéo. */
+          @StringRes
+          fun VideoQuality.labelRes(): Int = when (this) {
+              VideoQuality.TINY -> R.string.video_tiny
+              VideoQuality.LIGHT -> R.string.video_light
+              VideoQuality.BALANCED -> R.string.video_balanced
+              VideoQuality.HIGH -> R.string.video_high
+          }
+          DSP_EOF_31
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/editor'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/editor/EditorScreen.kt' << 'DSP_EOF_30'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/editor/EditorScreen.kt' << 'DSP_EOF_32'
           package com.docscan.pro.presentation.editor
 
           import android.graphics.BitmapFactory
@@ -3072,9 +4397,9 @@ jobs:
                   Spacer(Modifier.height(4.dp))
               }
           }
-          DSP_EOF_30
+          DSP_EOF_32
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/editor'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/editor/EditorViewModel.kt' << 'DSP_EOF_31'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/editor/EditorViewModel.kt' << 'DSP_EOF_33'
           package com.docscan.pro.presentation.editor
 
           import androidx.lifecycle.ViewModel
@@ -3194,9 +4519,9 @@ jobs:
                   }
               }
           }
-          DSP_EOF_31
+          DSP_EOF_33
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/export'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/export/Export.kt' << 'DSP_EOF_32'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/export/Export.kt' << 'DSP_EOF_34'
           package com.docscan.pro.presentation.export
 
           import androidx.compose.foundation.layout.Arrangement
@@ -3252,6 +4577,8 @@ jobs:
           import com.docscan.pro.core.utils.SecureWindow
           import com.docscan.pro.data.model.AppResult
           import com.docscan.pro.data.model.DocumentType
+          import com.docscan.pro.data.model.ExportFormat
+          import android.widget.Toast
           import com.docscan.pro.data.model.PdfQuality
           import com.docscan.pro.data.repository.ScanSession
           import com.docscan.pro.data.repository.SettingsRepository
@@ -3277,13 +4604,14 @@ jobs:
               val type: DocumentType = DocumentType.IMPRIME,
               val quality: PdfQuality = PdfQuality.MEDIUM,
               val protect: Boolean = false,
+              val format: ExportFormat = ExportFormat.PDF,
               val pageCount: Int = 0,
               val exporting: Boolean = false
           )
 
           /** Événements de l'export. */
           sealed interface ExportEvent {
-              data object Done : ExportEvent
+              data class Done(val toLibrary: Boolean) : ExportEvent
               data class Error(val message: String) : ExportEvent
           }
 
@@ -3316,6 +4644,9 @@ jobs:
               }
               fun setQuality(q: PdfQuality) = _state.update { it.copy(quality = q) }
               fun setProtect(p: Boolean) = _state.update { it.copy(protect = p) }
+              fun setFormat(f: ExportFormat) = _state.update {
+                  it.copy(format = f, protect = if (f == ExportFormat.JPG) false else it.protect)
+              }
 
               /** Lance l'export PDF. */
               fun export() {
@@ -3323,8 +4654,8 @@ jobs:
                   if (s.exporting) return
                   _state.update { it.copy(exporting = true) }
                   viewModelScope.launch {
-                      when (val r = exportPdf(ExportRequest(s.name.ifBlank { autoName(s.type) }, s.type, s.quality, s.protect))) {
-                          is AppResult.Success -> _events.send(ExportEvent.Done)
+                      when (val r = exportPdf(ExportRequest(s.name.ifBlank { autoName(s.type) }, s.type, s.quality, s.protect, s.format))) {
+                          is AppResult.Success -> _events.send(ExportEvent.Done(toLibrary = s.format == ExportFormat.PDF))
                           is AppResult.Error -> _events.send(ExportEvent.Error(r.message))
                       }
                       _state.update { it.copy(exporting = false) }
@@ -3334,7 +4665,7 @@ jobs:
 
           /** Écran d'export PDF. */
           @Composable
-          fun ExportScreen(onExported: () -> Unit, onBack: () -> Unit, vm: ExportViewModel = hiltViewModel()) {
+          fun ExportScreen(onExported: (toLibrary: Boolean) -> Unit, onBack: () -> Unit, vm: ExportViewModel = hiltViewModel()) {
               val state by vm.state.collectAsStateWithLifecycle()
               val context = LocalContext.current
               val snackbar = remember { SnackbarHostState() }
@@ -3343,7 +4674,10 @@ jobs:
               LaunchedEffect(Unit) {
                   vm.events.collect { e ->
                       when (e) {
-                          ExportEvent.Done -> onExported()
+                          is ExportEvent.Done -> {
+                              if (!e.toLibrary) Toast.makeText(context, R.string.export_saved_gallery, Toast.LENGTH_LONG).show()
+                              onExported(e.toLibrary)
+                          }
                           is ExportEvent.Error -> snackbar.showSnackbar(e.message)
                       }
                   }
@@ -3378,6 +4712,19 @@ jobs:
                           singleLine = true,
                           modifier = Modifier.fillMaxWidth()
                       )
+                      Text(stringResource(R.string.export_format), style = MaterialTheme.typography.titleMedium)
+                      SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                          val formats = ExportFormat.values()
+                          formats.forEachIndexed { i, f ->
+                              SegmentedButton(
+                                  selected = state.format == f,
+                                  onClick = { vm.setFormat(f) },
+                                  shape = SegmentedButtonDefaults.itemShape(i, formats.size)
+                              ) {
+                                  Text(stringResource(if (f == ExportFormat.PDF) R.string.format_pdf else R.string.format_jpg))
+                              }
+                          }
+                      }
                       Text(stringResource(R.string.export_type), style = MaterialTheme.typography.titleMedium)
                       Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                           DocumentType.values().forEach { t ->
@@ -3395,7 +4742,7 @@ jobs:
                               ) { Text(stringResource(q.labelRes())) }
                           }
                       }
-                      Card(Modifier.fillMaxWidth()) {
+                      if (state.format == ExportFormat.PDF) Card(Modifier.fillMaxWidth()) {
                           Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                               Icon(Icons.Outlined.Lock, null)
                               Spacer(Modifier.size(12.dp))
@@ -3424,242 +4771,14 @@ jobs:
                           modifier = Modifier.fillMaxWidth().height(56.dp)
                       ) {
                           if (state.exporting) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
-                          else Text(stringResource(R.string.action_save_pdf))
+                          else Text(stringResource(if (state.format == ExportFormat.PDF) R.string.action_save_pdf else R.string.action_save_images))
                       }
                   }
               }
           }
-          DSP_EOF_32
-          mkdir -p 'app/src/main/java/com/docscan/pro/presentation/home'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/home/Home.kt' << 'DSP_EOF_33'
-          package com.docscan.pro.presentation.home
-
-          import androidx.activity.compose.rememberLauncherForActivityResult
-          import androidx.activity.result.PickVisualMediaRequest
-          import androidx.activity.result.contract.ActivityResultContracts
-          import androidx.compose.foundation.background
-          import androidx.compose.foundation.layout.Arrangement
-          import androidx.compose.foundation.layout.Box
-          import androidx.compose.foundation.layout.Column
-          import androidx.compose.foundation.layout.Row
-          import androidx.compose.foundation.layout.Spacer
-          import androidx.compose.foundation.layout.fillMaxSize
-          import androidx.compose.foundation.layout.fillMaxWidth
-          import androidx.compose.foundation.layout.height
-          import androidx.compose.foundation.layout.padding
-          import androidx.compose.foundation.layout.size
-          import androidx.compose.foundation.lazy.LazyColumn
-          import androidx.compose.foundation.lazy.items
-          import androidx.compose.foundation.shape.RoundedCornerShape
-          import androidx.compose.material.icons.Icons
-          import androidx.compose.material.icons.outlined.CameraAlt
-          import androidx.compose.material.icons.outlined.FolderOpen
-          import androidx.compose.material.icons.outlined.PhotoLibrary
-          import androidx.compose.material.icons.outlined.Settings
-          import androidx.compose.material3.Button
-          import androidx.compose.material3.Card
-          import androidx.compose.material3.CircularProgressIndicator
-          import androidx.compose.material3.FilledTonalButton
-          import androidx.compose.material3.Icon
-          import androidx.compose.material3.IconButton
-          import androidx.compose.material3.MaterialTheme
-          import androidx.compose.material3.Scaffold
-          import androidx.compose.material3.SnackbarHost
-          import androidx.compose.material3.SnackbarHostState
-          import androidx.compose.material3.Text
-          import androidx.compose.material3.TextButton
-          import androidx.compose.material3.TopAppBar
-          import androidx.compose.runtime.Composable
-          import androidx.compose.runtime.LaunchedEffect
-          import androidx.compose.runtime.getValue
-          import androidx.compose.runtime.remember
-          import androidx.compose.ui.Alignment
-          import androidx.compose.ui.Modifier
-          import androidx.compose.ui.graphics.Brush
-          import androidx.compose.ui.graphics.Color
-          import androidx.compose.ui.platform.LocalContext
-          import androidx.compose.ui.res.stringResource
-          import androidx.compose.ui.unit.dp
-          import androidx.lifecycle.ViewModel
-          import androidx.lifecycle.compose.collectAsStateWithLifecycle
-          import androidx.lifecycle.viewModelScope
-          import androidx.hilt.navigation.compose.hiltViewModel
-          import com.docscan.pro.R
-          import com.docscan.pro.data.model.AppResult
-          import com.docscan.pro.data.model.Document
-          import com.docscan.pro.data.repository.DocumentRepository
-          import com.docscan.pro.data.repository.ScanSession
-          import com.docscan.pro.domain.usecase.ProcessCaptureUseCase
-          import com.docscan.pro.presentation.components.DocumentRow
-          import com.docscan.pro.presentation.theme.BrandBlue
-          import dagger.hilt.android.lifecycle.HiltViewModel
-          import kotlinx.coroutines.channels.Channel
-          import kotlinx.coroutines.flow.MutableStateFlow
-          import kotlinx.coroutines.flow.SharingStarted
-          import kotlinx.coroutines.flow.StateFlow
-          import kotlinx.coroutines.flow.asStateFlow
-          import kotlinx.coroutines.flow.map
-          import kotlinx.coroutines.flow.receiveAsFlow
-          import kotlinx.coroutines.flow.stateIn
-          import kotlinx.coroutines.launch
-          import javax.inject.Inject
-
-          /** Événements ponctuels de l'accueil. */
-          sealed interface HomeEvent {
-              data object Imported : HomeEvent
-              data class Error(val message: String) : HomeEvent
-          }
-
-          /** ViewModel de l'accueil : documents récents et import d'image. */
-          @HiltViewModel
-          class HomeViewModel @Inject constructor(
-              repository: DocumentRepository,
-              private val session: ScanSession,
-              private val processCapture: ProcessCaptureUseCase
-          ) : ViewModel() {
-
-              /** 3 documents les plus récents. */
-              val recent: StateFlow<List<Document>> = repository.observeDocuments()
-                  .map { it.take(3) }
-                  .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-
-              private val _busy = MutableStateFlow(false)
-              val busy: StateFlow<Boolean> = _busy.asStateFlow()
-
-              private val _events = Channel<HomeEvent>(Channel.BUFFERED)
-              val events = _events.receiveAsFlow()
-
-              /** Démarre une nouvelle session de scan. */
-              fun newSession() = session.clear(deleteFiles = true)
-
-              /** Importe une image depuis la galerie. */
-              fun import(uri: String) {
-                  newSession()
-                  viewModelScope.launch {
-                      _busy.value = true
-                      when (val r = processCapture.fromUri(uri)) {
-                          is AppResult.Success -> { session.add(r.data); _events.send(HomeEvent.Imported) }
-                          is AppResult.Error -> _events.send(HomeEvent.Error(r.message))
-                      }
-                      _busy.value = false
-                  }
-              }
-          }
-
-          /** Écran d'accueil. */
-          @Composable
-          fun HomeScreen(
-              onScan: () -> Unit,
-              onImported: () -> Unit,
-              onLibrary: () -> Unit,
-              onSettings: () -> Unit,
-              vm: HomeViewModel = hiltViewModel()
-          ) {
-              val recent by vm.recent.collectAsStateWithLifecycle()
-              val busy by vm.busy.collectAsStateWithLifecycle()
-              val snackbar = remember { SnackbarHostState() }
-              val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-                  if (uri != null) vm.import(uri.toString())
-              }
-              LaunchedEffect(Unit) {
-                  vm.events.collect { e ->
-                      when (e) {
-                          HomeEvent.Imported -> onImported()
-                          is HomeEvent.Error -> snackbar.showSnackbar(e.message)
-                      }
-                  }
-              }
-
-              Scaffold(
-                  topBar = {
-                      TopAppBar(
-                          title = { Text(stringResource(R.string.app_name)) },
-                          actions = {
-                              IconButton(onClick = onSettings) {
-                                  Icon(Icons.Outlined.Settings, contentDescription = stringResource(R.string.settings_title))
-                              }
-                          }
-                      )
-                  },
-                  snackbarHost = { SnackbarHost(snackbar) }
-              ) { padding ->
-                  LazyColumn(
-                      modifier = Modifier.fillMaxSize().padding(padding),
-                      contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp),
-                      verticalArrangement = Arrangement.spacedBy(12.dp)
-                  ) {
-                      item {
-                          Box(
-                              Modifier
-                                  .fillMaxWidth()
-                                  .background(
-                                      Brush.linearGradient(listOf(BrandBlue, Color(0xFF1F6FE0))),
-                                      RoundedCornerShape(24.dp)
-                                  )
-                                  .padding(20.dp)
-                          ) {
-                              Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                  Text(stringResource(R.string.home_title), style = MaterialTheme.typography.headlineMedium, color = Color.White)
-                                  Text(stringResource(R.string.home_subtitle), style = MaterialTheme.typography.bodyMedium, color = Color.White.copy(alpha = 0.85f))
-                                  Spacer(Modifier.height(8.dp))
-                                  Button(
-                                      onClick = { vm.newSession(); onScan() },
-                                      modifier = Modifier.fillMaxWidth().height(56.dp),
-                                      colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-                                          containerColor = Color.White, contentColor = BrandBlue
-                                      )
-                                  ) {
-                                      Icon(Icons.Outlined.CameraAlt, contentDescription = null)
-                                      Spacer(Modifier.size(8.dp))
-                                      Text(stringResource(R.string.action_scan))
-                                  }
-                                  FilledTonalButton(
-                                      onClick = {
-                                          picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                                      },
-                                      enabled = !busy,
-                                      modifier = Modifier.fillMaxWidth()
-                                  ) {
-                                      if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-                                      else Icon(Icons.Outlined.PhotoLibrary, contentDescription = null)
-                                      Spacer(Modifier.size(8.dp))
-                                      Text(stringResource(R.string.action_import))
-                                  }
-                              }
-                          }
-                      }
-                      item {
-                          Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                              Text(stringResource(R.string.home_recent), style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
-                              TextButton(onClick = onLibrary) {
-                                  Icon(Icons.Outlined.FolderOpen, contentDescription = null)
-                                  Spacer(Modifier.size(6.dp))
-                                  Text(stringResource(R.string.home_see_all))
-                              }
-                          }
-                      }
-                      if (recent.isEmpty()) {
-                          item {
-                              Card(Modifier.fillMaxWidth()) {
-                                  Text(
-                                      stringResource(R.string.home_empty),
-                                      modifier = Modifier.padding(20.dp),
-                                      style = MaterialTheme.typography.bodyMedium,
-                                      color = MaterialTheme.colorScheme.onSurfaceVariant
-                                  )
-                              }
-                          }
-                      } else {
-                          items(recent, key = { it.id }) { doc ->
-                              DocumentRow(doc = doc, onClick = onLibrary)
-                          }
-                      }
-                  }
-              }
-          }
-          DSP_EOF_33
+          DSP_EOF_34
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/library'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/library/Library.kt' << 'DSP_EOF_34'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/library/Library.kt' << 'DSP_EOF_35'
           package com.docscan.pro.presentation.library
 
           import androidx.compose.foundation.layout.Arrangement
@@ -3896,9 +5015,9 @@ jobs:
                   )
               }
           }
-          DSP_EOF_34
+          DSP_EOF_35
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/navigation'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/navigation/NavGraph.kt' << 'DSP_EOF_35'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/navigation/NavGraph.kt' << 'DSP_EOF_36'
           package com.docscan.pro.presentation.navigation
 
           import androidx.compose.runtime.Composable
@@ -3909,13 +5028,11 @@ jobs:
           import com.docscan.pro.presentation.camera.CameraScreen
           import com.docscan.pro.presentation.editor.EditorScreen
           import com.docscan.pro.presentation.export.ExportScreen
-          import com.docscan.pro.presentation.home.HomeScreen
           import com.docscan.pro.presentation.library.LibraryScreen
           import com.docscan.pro.presentation.settings.SettingsScreen
 
           /** Écrans de l'application. */
           sealed class Screen(val route: String) {
-              data object Home : Screen("home")
               data object Camera : Screen("camera")
               data object Editor : Screen("editor")
               data object Export : Screen("export")
@@ -3923,57 +5040,52 @@ jobs:
               data object Settings : Screen("settings")
           }
 
-          /** Graphe de navigation : Home → Camera ⇄ Editor → Export → Library. */
+          /** Graphe : Caméra (écran principal) ⇄ Éditeur → Export → Bibliothèque. */
           @Composable
           fun DocScanNavGraph(nav: NavHostController = rememberNavController()) {
-              NavHost(navController = nav, startDestination = Screen.Home.route) {
-                  composable(Screen.Home.route) {
-                      HomeScreen(
-                          onScan = { nav.navigate(Screen.Camera.route) },
-                          onImported = { nav.navigate(Screen.Editor.route) },
-                          onLibrary = { nav.navigate(Screen.Library.route) },
-                          onSettings = { nav.navigate(Screen.Settings.route) }
-                      )
-                  }
+              NavHost(navController = nav, startDestination = Screen.Camera.route) {
                   composable(Screen.Camera.route) {
                       CameraScreen(
-                          onCaptured = {
-                              nav.navigate(Screen.Editor.route) {
-                                  popUpTo(Screen.Camera.route) { inclusive = true }
-                                  launchSingleTop = true
-                              }
-                          },
-                          onBack = { nav.popBackStack() }
+                          onOpenEditor = { nav.navigate(Screen.Editor.route) { launchSingleTop = true } },
+                          onLibrary = { nav.navigate(Screen.Library.route) { launchSingleTop = true } },
+                          onSettings = { nav.navigate(Screen.Settings.route) { launchSingleTop = true } }
                       )
                   }
                   composable(Screen.Editor.route) {
                       EditorScreen(
-                          onAddPage = { nav.navigate(Screen.Camera.route) },
-                          onFinish = { nav.navigate(Screen.Export.route) },
-                          onBack = { nav.popBackStack(Screen.Home.route, inclusive = false) }
+                          onAddPage = { nav.popBackStack(Screen.Camera.route, inclusive = false) },
+                          onFinish = { nav.navigate(Screen.Export.route) { launchSingleTop = true } },
+                          onBack = { nav.popBackStack(Screen.Camera.route, inclusive = false) }
                       )
                   }
                   composable(Screen.Export.route) {
                       ExportScreen(
-                          onExported = {
-                              nav.navigate(Screen.Library.route) {
-                                  popUpTo(Screen.Home.route) { inclusive = false }
+                          onExported = { toLibrary ->
+                              if (toLibrary) {
+                                  nav.navigate(Screen.Library.route) {
+                                      popUpTo(Screen.Camera.route) { inclusive = false }
+                                  }
+                              } else {
+                                  nav.popBackStack(Screen.Camera.route, inclusive = false)
                               }
                           },
                           onBack = { nav.popBackStack() }
                       )
                   }
                   composable(Screen.Library.route) {
-                      LibraryScreen(onBack = { nav.popBackStack() }, onScan = { nav.navigate(Screen.Camera.route) })
+                      LibraryScreen(
+                          onBack = { nav.popBackStack() },
+                          onScan = { nav.popBackStack(Screen.Camera.route, inclusive = false) }
+                      )
                   }
                   composable(Screen.Settings.route) {
                       SettingsScreen(onBack = { nav.popBackStack() })
                   }
               }
           }
-          DSP_EOF_35
+          DSP_EOF_36
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/settings'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/settings/Settings.kt' << 'DSP_EOF_36'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/settings/Settings.kt' << 'DSP_EOF_37'
           package com.docscan.pro.presentation.settings
 
           import androidx.compose.foundation.layout.Arrangement
@@ -4012,6 +5124,20 @@ jobs:
           import com.docscan.pro.R
           import com.docscan.pro.data.model.AppSettings
           import com.docscan.pro.data.model.PdfQuality
+          import com.docscan.pro.data.model.PhotoDestination
+          import com.docscan.pro.data.model.VideoQuality
+          import com.docscan.pro.di.CameraEntryPoint
+          import dagger.hilt.android.EntryPointAccessors
+          import android.content.Intent
+          import android.widget.Toast
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.material.icons.outlined.CreateNewFolder
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.remember
+          import androidx.compose.ui.platform.LocalContext
           import com.docscan.pro.data.model.ScanFilter
           import com.docscan.pro.data.repository.SettingsRepository
           import com.docscan.pro.presentation.components.labelRes
@@ -4029,12 +5155,33 @@ jobs:
               fun setAuto(v: Boolean) = viewModelScope.launch { repo.setAutoCapture(v) }
               fun setFilter(f: ScanFilter) = viewModelScope.launch { repo.setDefaultFilter(f) }
               fun setQuality(q: PdfQuality) = viewModelScope.launch { repo.setPdfQuality(q) }
+              fun setFaces(v: Boolean) = viewModelScope.launch { repo.setFaceDetection(v) }
+              fun setVideoQuality(q: VideoQuality) = viewModelScope.launch { repo.setVideoQuality(q) }
+              fun setDestination(d: PhotoDestination) = viewModelScope.launch { repo.setPhotoDestination(d) }
+              fun setCustomFolder(treeUri: String) = viewModelScope.launch { repo.setPhotoDestination(PhotoDestination.CUSTOM, treeUri) }
           }
 
           /** Écran des réglages. */
           @Composable
           fun SettingsScreen(onBack: () -> Unit, vm: SettingsViewModel = hiltViewModel()) {
               val s by vm.settings.collectAsStateWithLifecycle()
+              val context = LocalContext.current
+              val gallery = remember {
+                  EntryPointAccessors.fromApplication(context.applicationContext, CameraEntryPoint::class.java).galleryStore()
+              }
+              val customName = remember(s.photoTreeUri) { gallery.folderName(s.photoTreeUri) }
+              val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+                  if (uri != null) {
+                      try {
+                          context.contentResolver.takePersistableUriPermission(
+                              uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                          )
+                          vm.setCustomFolder(uri.toString())
+                      } catch (e: SecurityException) {
+                          Toast.makeText(context, R.string.error_folder, Toast.LENGTH_LONG).show()
+                      }
+                  }
+              }
               Scaffold(
                   topBar = {
                       TopAppBar(
@@ -4058,6 +5205,60 @@ jobs:
                               }
                               Switch(checked = s.autoCapture, onCheckedChange = { vm.setAuto(it) })
                           }
+                      }
+                      Card(Modifier.fillMaxWidth()) {
+                          Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                              Column(Modifier.weight(1f)) {
+                                  Text(stringResource(R.string.settings_faces), style = MaterialTheme.typography.titleMedium)
+                                  Text(stringResource(R.string.settings_faces_desc), style = MaterialTheme.typography.bodyMedium,
+                                      color = MaterialTheme.colorScheme.onSurfaceVariant)
+                              }
+                              Switch(checked = s.faceDetection, onCheckedChange = { vm.setFaces(it) })
+                          }
+                      }
+                      Section(stringResource(R.string.settings_photo_folder)) {
+                          RadioRow(stringResource(R.string.dest_pictures), s.photoDest == PhotoDestination.PICTURES) {
+                              vm.setDestination(PhotoDestination.PICTURES)
+                          }
+                          RadioRow(stringResource(R.string.dest_dcim), s.photoDest == PhotoDestination.DCIM) {
+                              vm.setDestination(PhotoDestination.DCIM)
+                          }
+                          RadioRow(
+                              if (customName != null) stringResource(R.string.dest_custom_named, customName)
+                              else stringResource(R.string.dest_custom),
+                              s.photoDest == PhotoDestination.CUSTOM
+                          ) {
+                              if (s.photoTreeUri != null && customName != null) vm.setDestination(PhotoDestination.CUSTOM)
+                              else folderPicker.launch(null)
+                          }
+                          TextButton(
+                              onClick = { folderPicker.launch(null) },
+                              modifier = Modifier.padding(start = 8.dp)
+                          ) {
+                              Icon(Icons.Outlined.CreateNewFolder, contentDescription = null)
+                              Spacer(Modifier.size(8.dp))
+                              Text(stringResource(R.string.action_choose_folder))
+                          }
+                          Text(
+                              stringResource(R.string.settings_photo_folder_desc),
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                          )
+                      }
+                      Section(stringResource(R.string.settings_video_quality)) {
+                          VideoQuality.values().forEach { q ->
+                              RadioRow(
+                                  stringResource(q.labelRes()) + " · " + stringResource(R.string.video_size_per_min, q.mbPerMinute),
+                                  s.videoQuality == q
+                              ) { vm.setVideoQuality(q) }
+                          }
+                          Text(
+                              stringResource(R.string.settings_video_desc),
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                          )
                       }
                       Section(stringResource(R.string.settings_default_filter)) {
                           ScanFilter.values().forEach { f ->
@@ -4100,9 +5301,9 @@ jobs:
                   Text(label, modifier = Modifier.padding(start = 8.dp))
               }
           }
-          DSP_EOF_36
+          DSP_EOF_37
           mkdir -p 'app/src/main/java/com/docscan/pro/presentation/theme'
-          cat > 'app/src/main/java/com/docscan/pro/presentation/theme/Theme.kt' << 'DSP_EOF_37'
+          cat > 'app/src/main/java/com/docscan/pro/presentation/theme/Theme.kt' << 'DSP_EOF_38'
           package com.docscan.pro.presentation.theme
 
           import androidx.compose.foundation.isSystemInDarkTheme
@@ -4181,9 +5382,9 @@ jobs:
                   content = content
               )
           }
-          DSP_EOF_37
+          DSP_EOF_38
           mkdir -p 'app/src/main/res/drawable'
-          cat > 'app/src/main/res/drawable/ic_launcher_foreground.xml' << 'DSP_EOF_38'
+          cat > 'app/src/main/res/drawable/ic_launcher_foreground.xml' << 'DSP_EOF_39'
           <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
@@ -4214,18 +5415,18 @@ jobs:
                   android:fillColor="#FF00C853"
                   android:pathData="M33,65h42v2.5h-42z" />
           </vector>
-          DSP_EOF_38
+          DSP_EOF_39
           mkdir -p 'app/src/main/res/mipmap-anydpi-v26'
-          cat > 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' << 'DSP_EOF_39'
+          cat > 'app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml' << 'DSP_EOF_40'
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@color/ic_launcher_background" />
               <foreground android:drawable="@drawable/ic_launcher_foreground" />
               <monochrome android:drawable="@drawable/ic_launcher_foreground" />
           </adaptive-icon>
-          DSP_EOF_39
+          DSP_EOF_40
           mkdir -p 'app/src/main/res/values-en'
-          cat > 'app/src/main/res/values-en/strings.xml' << 'DSP_EOF_40'
+          cat > 'app/src/main/res/values-en/strings.xml' << 'DSP_EOF_41'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">DocScan Pro</string>
@@ -4310,14 +5511,57 @@ jobs:
               <string name="type_dessin">Drawing</string>
               <string name="type_imprime">Printed</string>
               <string name="type_manuscrit">Handwritten</string>
+              <string name="mode_document">Documents</string>
+              <string name="mode_photo">Photo</string>
+              <string name="torch_on">Torch on</string>
+              <string name="torch_off">Torch off</string>
+              <string name="flash_off">Flash off</string>
+              <string name="flash_auto">Flash auto</string>
+              <string name="flash_on">Flash on</string>
+              <string name="action_switch_camera">Switch camera</string>
+              <string name="action_view_photo">View last photo</string>
+              <string name="action_open_pages">Open scanned pages (%1$d)</string>
+              <string name="error_no_viewer">No app can show this photo.</string>
+              <string name="export_format">Format</string>
+              <string name="format_pdf">PDF</string>
+              <string name="format_jpg">JPG images</string>
+              <string name="export_saved_gallery">Images saved to your photo folder</string>
+              <string name="action_save_images">Save to gallery</string>
+              <string name="settings_photo_folder">Photo folder</string>
+              <string name="settings_photo_folder_desc">Photos and exported images are saved here.</string>
+              <string name="dest_pictures">Pictures › DocScan Pro</string>
+              <string name="dest_dcim">DCIM › Camera (with phone photos)</string>
+              <string name="dest_custom">Other folder…</string>
+              <string name="dest_custom_named">Folder: %1$s</string>
+              <string name="action_choose_folder">Choose a folder</string>
+              <string name="error_folder">This folder can\'t be used. Choose another one.</string>
+              <string name="mode_video">Video</string>
+              <string name="video_tiny">Very light (480p, 360p file size)</string>
+              <string name="video_light">Light 720p</string>
+              <string name="video_balanced">Balanced 1080p (recommended)</string>
+              <string name="video_high">High 1080p</string>
+              <string name="video_size_per_min">≈ %1$d MB/min</string>
+              <string name="settings_video_quality">Video quality</string>
+              <string name="settings_video_desc">Optimized bitrate: sharp image, file 3 to 5 times smaller than a standard phone video.</string>
+              <string name="action_start_video">Start video</string>
+              <string name="action_stop_video">Stop video</string>
+              <string name="error_video">Video recording failed.</string>
+              <string name="action_system_camera">Phone camera (maximum quality)</string>
+              <string name="error_no_camera_app">No camera app available.</string>
+              <string name="settings_faces">Face detection</string>
+              <string name="settings_faces_desc">Photo mode: yellow frames and automatic focus on faces.</string>
+              <plurals name="faces_detected">
+                  <item quantity="one">%1$d face detected</item>
+                  <item quantity="other">%1$d faces detected</item>
+              </plurals>
               <plurals name="page_count">
                   <item quantity="one">%1$d page</item>
                   <item quantity="other">%1$d pages</item>
               </plurals>
           </resources>
-          DSP_EOF_40
+          DSP_EOF_41
           mkdir -p 'app/src/main/res/values'
-          cat > 'app/src/main/res/values/strings.xml' << 'DSP_EOF_41'
+          cat > 'app/src/main/res/values/strings.xml' << 'DSP_EOF_42'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="app_name">DocScan Pro</string>
@@ -4402,14 +5646,57 @@ jobs:
               <string name="type_dessin">Dessin</string>
               <string name="type_imprime">Imprimé</string>
               <string name="type_manuscrit">Manuscrit</string>
+              <string name="mode_document">Documents</string>
+              <string name="mode_photo">Photo</string>
+              <string name="torch_on">Lampe allumée</string>
+              <string name="torch_off">Lampe éteinte</string>
+              <string name="flash_off">Flash désactivé</string>
+              <string name="flash_auto">Flash automatique</string>
+              <string name="flash_on">Flash activé</string>
+              <string name="action_switch_camera">Changer de caméra</string>
+              <string name="action_view_photo">Voir la dernière photo</string>
+              <string name="action_open_pages">Ouvrir les pages scannées (%1$d)</string>
+              <string name="error_no_viewer">Aucune application pour afficher la photo.</string>
+              <string name="export_format">Format</string>
+              <string name="format_pdf">PDF</string>
+              <string name="format_jpg">Images JPG</string>
+              <string name="export_saved_gallery">Images enregistrées dans votre dossier de photos</string>
+              <string name="action_save_images">Enregistrer dans la galerie</string>
+              <string name="settings_photo_folder">Dossier des photos</string>
+              <string name="settings_photo_folder_desc">Les photos et les images exportées y sont enregistrées.</string>
+              <string name="dest_pictures">Images › DocScan Pro</string>
+              <string name="dest_dcim">DCIM › Camera (avec les photos du téléphone)</string>
+              <string name="dest_custom">Autre dossier…</string>
+              <string name="dest_custom_named">Dossier : %1$s</string>
+              <string name="action_choose_folder">Choisir un dossier</string>
+              <string name="error_folder">Impossible d\'utiliser ce dossier. Choisissez-en un autre.</string>
+              <string name="mode_video">Vidéo</string>
+              <string name="video_tiny">Très légère (480p, poids d\'une 360p)</string>
+              <string name="video_light">Légère 720p</string>
+              <string name="video_balanced">Équilibrée 1080p (conseillée)</string>
+              <string name="video_high">Haute 1080p</string>
+              <string name="video_size_per_min">≈ %1$d Mo/min</string>
+              <string name="settings_video_quality">Qualité vidéo</string>
+              <string name="settings_video_desc">Débit optimisé : image nette, fichier 3 à 5 fois plus léger qu\'une vidéo standard du téléphone.</string>
+              <string name="action_start_video">Démarrer la vidéo</string>
+              <string name="action_stop_video">Arrêter la vidéo</string>
+              <string name="error_video">Enregistrement vidéo impossible.</string>
+              <string name="action_system_camera">Appareil photo du téléphone (qualité maximale)</string>
+              <string name="error_no_camera_app">Aucune application appareil photo disponible.</string>
+              <string name="settings_faces">Détection des visages</string>
+              <string name="settings_faces_desc">Mode Photo : cadres jaunes et mise au point automatique sur les visages.</string>
+              <plurals name="faces_detected">
+                  <item quantity="one">%1$d visage détecté</item>
+                  <item quantity="other">%1$d visages détectés</item>
+              </plurals>
               <plurals name="page_count">
                   <item quantity="one">%1$d page</item>
                   <item quantity="other">%1$d pages</item>
               </plurals>
           </resources>
-          DSP_EOF_41
+          DSP_EOF_42
           mkdir -p 'app/src/main/res/values'
-          cat > 'app/src/main/res/values/themes.xml' << 'DSP_EOF_42'
+          cat > 'app/src/main/res/values/themes.xml' << 'DSP_EOF_43'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <style name="Theme.DocScanPro" parent="android:Theme.Material.Light.NoActionBar">
@@ -4420,18 +5707,19 @@ jobs:
               <color name="splash_bg">#FFF6F8FC</color>
               <color name="ic_launcher_background">#FF0F3D91</color>
           </resources>
-          DSP_EOF_42
+          DSP_EOF_43
           mkdir -p 'app/src/main/res/xml'
-          cat > 'app/src/main/res/xml/file_paths.xml' << 'DSP_EOF_43'
+          cat > 'app/src/main/res/xml/file_paths.xml' << 'DSP_EOF_44'
           <?xml version="1.0" encoding="utf-8"?>
           <paths>
               <external-files-path name="docs" path="." />
               <cache-path name="cache" path="." />
               <files-path name="files" path="." />
+              <external-path name="external" path="." />
           </paths>
-          DSP_EOF_43
+          DSP_EOF_44
           mkdir -p 'app/src/test/java/com/docscan/pro'
-          cat > 'app/src/test/java/com/docscan/pro/CoreLogicTest.kt' << 'DSP_EOF_44'
+          cat > 'app/src/test/java/com/docscan/pro/CoreLogicTest.kt' << 'DSP_EOF_45'
           package com.docscan.pro
 
           import com.docscan.pro.data.model.Detection
@@ -4503,7 +5791,7 @@ jobs:
                   assertEquals(0f, lost.progress, 0f)
               }
           }
-          DSP_EOF_44
+          DSP_EOF_45
           echo "Fichiers generes :"; find . -type f | wc -l
 
       - name: Preparer le keystore (cree une fois, puis reutilise)
@@ -4532,14 +5820,14 @@ jobs:
       - name: Renommer l'APK
         run: |
           mkdir -p out
-          cp docscan-pro/app/build/outputs/apk/release/app-release.apk out/DocScanPro-v1.0.0.apk
+          cp docscan-pro/app/build/outputs/apk/release/app-release.apk out/DocScanPro-v1.4.0.apk
           ls -lh out
 
       - name: Publier l'APK
         uses: actions/upload-artifact@v4
         with:
           name: DocScanPro-APK
-          path: out/DocScanPro-v1.0.0.apk
+          path: out/DocScanPro-v1.4.0.apk
           retention-days: 30
 
       - name: Tests unitaires (optionnel)
