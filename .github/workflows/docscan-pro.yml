@@ -127,8 +127,8 @@ jobs:
                   applicationId = "com.docscan.pro"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 6
-                  versionName = "1.4.0"
+                  versionCode = 7
+                  versionName = "1.4.1"
                   testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
                   vectorDrawables { useSupportLibrary = true }
                   ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
@@ -2239,14 +2239,14 @@ jobs:
               val autoCapture: Boolean = true,
               val defaultFilter: ScanFilter = ScanFilter.DOCUMENT,
               val pdfQuality: PdfQuality = PdfQuality.MEDIUM,
-              val lastMode: CameraMode = CameraMode.DOCUMENT,
+              val lastMode: CameraMode = CameraMode.PHOTO,
               val photoDest: PhotoDestination = PhotoDestination.PICTURES,
               /** Dossier choisi par l'utilisateur (Uri d'arborescence SAF), si CUSTOM. */
               val photoTreeUri: String? = null,
               val lastPhotoUri: String? = null,
               val lastMediaIsVideo: Boolean = false,
               val videoQuality: VideoQuality = VideoQuality.BALANCED,
-              val faceDetection: Boolean = true
+              val faceDetection: Boolean = false
           )
 
           /** Résultat de détection d'un document sur une image. */
@@ -2353,13 +2353,13 @@ jobs:
                       autoCapture = p[keyAuto] ?: true,
                       defaultFilter = enumOr(p[keyFilter], ScanFilter.DOCUMENT),
                       pdfQuality = enumOr(p[keyQuality], PdfQuality.MEDIUM),
-                      lastMode = enumOr(p[keyMode], CameraMode.DOCUMENT),
+                      lastMode = enumOr(p[keyMode], CameraMode.PHOTO),
                       photoDest = enumOr(p[keyDest], PhotoDestination.PICTURES),
                       photoTreeUri = p[keyTree],
                       lastPhotoUri = p[keyLastPhoto],
                       lastMediaIsVideo = p[keyLastIsVideo] ?: false,
                       videoQuality = enumOr(p[keyVideoQuality], VideoQuality.BALANCED),
-                      faceDetection = p[keyFaces] ?: true
+                      faceDetection = p[keyFaces] ?: false
                   )
               }
 
@@ -2769,20 +2769,21 @@ jobs:
                           // Réécrit l'original orienté et réduit : toutes les coordonnées restent cohérentes.
                           fileStore.saveJpeg(bmp, File(path), 95)
                           val det = detect(bmp)
-                          // Cadrage automatique : détection sur la photo, sinon le cadre vu en direct.
-                          val quad = when {
-                              det != null && det.confidence >= 0.55f -> det.quad
+                          // Cadrage automatique seulement si un document est vraiment trouvé
+                          // (sur la photo, ou vu en direct au moment du déclenchement).
+                          // Sinon rien n'est forcé : la photo reste entière, sans filtre.
+                          val quad: Quad? = when {
+                              det != null && det.confidence >= 0.6f -> det.quad
                               hint != null -> hint
-                              det != null -> det.quad
-                              else -> Quad.FULL_INSET
+                              else -> null
                           }
-                          val filter = settings.current().defaultFilter
-                          val warped = corrector.warp(bmp, quad)
+                          val filter = if (quad != null) settings.current().defaultFilter else ScanFilter.ORIGINAL
+                          val warped = if (quad != null) corrector.warp(bmp, quad) else bmp.copy(Bitmap.Config.ARGB_8888, false)
                           val processed = enhancer.apply(warped, filter)
                           val warpedPath = fileStore.saveJpeg(warped, fileStore.newImageFile("warp"), 97)
                           val processedPath = fileStore.saveJpeg(processed, fileStore.newImageFile("proc"), 95)
                           warped.recycle(); processed.recycle()
-                          DraftPage(UUID.randomUUID().toString(), path, warpedPath, processedPath, filter, quad)
+                          DraftPage(UUID.randomUUID().toString(), path, warpedPath, processedPath, filter, quad ?: Quad.FULL)
                       } finally {
                           bmp.recycle()
                       }
@@ -2889,6 +2890,8 @@ jobs:
           import androidx.compose.material.icons.outlined.FlashOn
           import androidx.compose.material.icons.outlined.FlashlightOff
           import androidx.compose.material.icons.outlined.FlashlightOn
+          import androidx.compose.material.icons.outlined.Face
+          import androidx.compose.material.icons.outlined.FaceRetouchingOff
           import androidx.compose.material.icons.outlined.FolderOpen
           import androidx.compose.material.icons.outlined.HighQuality
           import androidx.compose.material.icons.outlined.PhotoLibrary
@@ -3242,6 +3245,16 @@ jobs:
                                   Icons.Outlined.AutoMode,
                                   stringResource(if (state.autoCapture) R.string.auto_on else R.string.auto_off),
                                   tint = if (state.autoCapture) ScanGreen else Color.White
+                              )
+                          }
+                          Spacer(Modifier.size(8.dp))
+                      }
+                      if (state.mode == CameraMode.PHOTO) {
+                          RoundIcon(onClick = vm::toggleFaces) {
+                              Icon(
+                                  if (state.faceDetection) Icons.Outlined.Face else Icons.Outlined.FaceRetouchingOff,
+                                  stringResource(if (state.faceDetection) R.string.faces_on else R.string.faces_off),
+                                  tint = if (state.faceDetection) ModeYellow else Color.White
                               )
                           }
                           Spacer(Modifier.size(8.dp))
@@ -3625,7 +3638,7 @@ jobs:
 
           /** État de l'écran caméra. */
           data class CameraUiState(
-              val mode: CameraMode = CameraMode.DOCUMENT,
+              val mode: CameraMode = CameraMode.PHOTO,
               val quad: Quad? = null,
               val frameWidth: Int = 480,
               val frameHeight: Int = 640,
@@ -3650,7 +3663,7 @@ jobs:
               val recordSeconds: Long = 0,
               val recordBytes: Long = 0,
               val videoBusy: Boolean = false,
-              val faceDetection: Boolean = true,
+              val faceDetection: Boolean = false,
               val faces: List<FaceBox> = emptyList(),
               val faceFrameWidth: Int = 480,
               val faceFrameHeight: Int = 640
@@ -3908,6 +3921,13 @@ jobs:
               fun switchLens() {
                   val st = _state.value
                   if (st.mode != CameraMode.DOCUMENT && !st.recording && !st.videoBusy) _state.update { it.copy(front = !it.front) }
+              }
+
+              /** Active / désactive la détection des visages (bouton du mode Photo). */
+              fun toggleFaces() {
+                  val v = !_state.value.faceDetection
+                  if (!v) _state.update { it.copy(faces = emptyList()) }
+                  viewModelScope.launch { settings.setFaceDetection(v) }
               }
 
               /** Bascule de la capture automatique. */
@@ -5487,7 +5507,7 @@ jobs:
               <string name="hint_hold_still">Document found, hold position</string>
               <string name="hint_processing">Processing…</string>
               <string name="hint_ready">Ready: tap to capture</string>
-              <string name="hint_searching">Frame the document</string>
+              <string name="hint_searching">No document found: the photo will stay whole</string>
               <string name="home_title">Scan in a snap</string>
               <string name="home_subtitle" formatted="false">Auto detection, straightening and filters, 100% on-device.</string>
               <string name="home_recent">Recent documents</string>
@@ -5549,7 +5569,9 @@ jobs:
               <string name="action_system_camera">Phone camera (maximum quality)</string>
               <string name="error_no_camera_app">No camera app available.</string>
               <string name="settings_faces">Face detection</string>
-              <string name="settings_faces_desc">Photo mode: yellow frames and automatic focus on faces.</string>
+              <string name="settings_faces_desc">Off by default. Photo mode: yellow frames and focus on faces.</string>
+              <string name="faces_on">Face detection on</string>
+              <string name="faces_off">Face detection off</string>
               <plurals name="faces_detected">
                   <item quantity="one">%1$d face detected</item>
                   <item quantity="other">%1$d faces detected</item>
@@ -5622,7 +5644,7 @@ jobs:
               <string name="hint_hold_still">Document détecté, gardez la position</string>
               <string name="hint_processing">Traitement en cours…</string>
               <string name="hint_ready">Prêt : appuyez pour capturer</string>
-              <string name="hint_searching">Cadrez le document</string>
+              <string name="hint_searching">Aucun document détecté : la photo restera entière</string>
               <string name="home_title">Scannez en un instant</string>
               <string name="home_subtitle" formatted="false">Détection automatique, redressement et filtres, 100 % sur l\'appareil.</string>
               <string name="home_recent">Documents récents</string>
@@ -5684,7 +5706,9 @@ jobs:
               <string name="action_system_camera">Appareil photo du téléphone (qualité maximale)</string>
               <string name="error_no_camera_app">Aucune application appareil photo disponible.</string>
               <string name="settings_faces">Détection des visages</string>
-              <string name="settings_faces_desc">Mode Photo : cadres jaunes et mise au point automatique sur les visages.</string>
+              <string name="settings_faces_desc">Désactivée par défaut. Mode Photo : cadres jaunes et mise au point sur les visages.</string>
+              <string name="faces_on">Détection des visages activée</string>
+              <string name="faces_off">Détection des visages désactivée</string>
               <plurals name="faces_detected">
                   <item quantity="one">%1$d visage détecté</item>
                   <item quantity="other">%1$d visages détectés</item>
@@ -5820,14 +5844,14 @@ jobs:
       - name: Renommer l'APK
         run: |
           mkdir -p out
-          cp docscan-pro/app/build/outputs/apk/release/app-release.apk out/DocScanPro-v1.4.0.apk
+          cp docscan-pro/app/build/outputs/apk/release/app-release.apk out/DocScanPro-v1.4.1.apk
           ls -lh out
 
       - name: Publier l'APK
         uses: actions/upload-artifact@v4
         with:
           name: DocScanPro-APK
-          path: out/DocScanPro-v1.4.0.apk
+          path: out/DocScanPro-v1.4.1.apk
           retention-days: 30
 
       - name: Tests unitaires (optionnel)
